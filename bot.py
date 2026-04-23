@@ -4,11 +4,10 @@ import os
 import sqlite3
 
 # =========================
-# BOT SETUP
+# BOT SETUP (SAFE INTENTS)
 # =========================
 intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
+intents.message_content = True  # only needed intent
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
@@ -47,8 +46,7 @@ CREATE TABLE IF NOT EXISTS matches (
     map TEXT,
     winner TEXT,
     score TEXT,
-    mvp TEXT,
-    adr TEXT
+    mvp TEXT
 )
 """)
 
@@ -75,7 +73,7 @@ def in_team(uid):
     return c.fetchone()
 
 def is_admin(ctx):
-    return any(r.permissions.administrator for r in ctx.author.roles)
+    return ctx.author.guild_permissions.administrator
 
 def ann(guild, embed):
     ch = discord.utils.get(guild.text_channels, name=ANN_CHANNEL)
@@ -101,57 +99,11 @@ def add_mvp(uid):
     conn.commit()
 
 # =========================
-# TEAM ACR
-# =========================
-def update_team_acr(team):
-    c.execute("SELECT members FROM teams WHERE name=?", (team,))
-    members = clean(c.fetchone()[0])
-
-    total = 0
-    count = 0
-
-    for m in members:
-        c.execute("SELECT acr FROM players WHERE id=?", (m,))
-        r = c.fetchone()
-        if r:
-            total += r[0]
-            count += 1
-
-    avg = int(total / count) if count else 1000
-
-    c.execute("UPDATE teams SET acr=? WHERE name=?", (team, avg))
-    conn.commit()
-
-# =========================
 # READY
 # =========================
 @bot.event
 async def on_ready():
     print(f"BOT ONLINE: {bot.user}")
-
-# =========================
-# NORMAL COMMANDS
-# =========================
-@bot.command()
-async def commands(ctx):
-    embed = discord.Embed(title="🎮 COMMANDS", color=0x3498db)
-    embed.add_field(name="Teams", value="!create !join !leave", inline=False)
-    embed.add_field(name="Stats", value="!stats [user]", inline=False)
-    embed.add_field(name="Match", value="!matches", inline=False)
-    await ctx.send(embed=embed)
-
-# =========================
-# ADMIN COMMANDS
-# =========================
-@bot.command()
-async def admincommands(ctx):
-    if not is_admin(ctx):
-        return await ctx.send("❌ Admin only")
-
-    embed = discord.Embed(title="🛠 ADMIN COMMANDS", color=0xe74c3c)
-    embed.add_field(name="Match", value="!start !win", inline=False)
-    embed.add_field(name="Team", value="!addplayer !removeplayer", inline=False)
-    await ctx.send(embed=embed)
 
 # =========================
 # TEAMS
@@ -178,12 +130,12 @@ async def join(ctx, name):
 
     team = get_team(name.upper())
     if not team:
-        return await ctx.send("❌ Not found")
+        return await ctx.send("❌ Team not found")
 
     members = clean(team[1])
 
     if len(members) >= 5:
-        return await ctx.send("❌ Full team")
+        return await ctx.send("❌ Team full")
 
     members.append(uid)
 
@@ -211,7 +163,7 @@ async def leave(ctx):
     await ctx.send("🚪 Left team")
 
 # =========================
-# STATS (SELF + OTHER)
+# STATS
 # =========================
 @bot.command()
 async def stats(ctx, member: discord.Member = None):
@@ -221,13 +173,13 @@ async def stats(ctx, member: discord.Member = None):
     create_player(uid)
 
     c.execute("SELECT acr,wins,losses,mvp FROM players WHERE id=?", (uid,))
-    a,w,l,mvp = c.fetchone()
+    a,w,l,m = c.fetchone()
 
     embed = discord.Embed(title=f"📊 STATS - {member.name}", color=0x00ffcc)
     embed.add_field(name="ACR", value=a)
     embed.add_field(name="Wins", value=w)
     embed.add_field(name="Losses", value=l)
-    embed.add_field(name="MVPs", value=mvp)
+    embed.add_field(name="MVPs", value=m)
 
     await ctx.send(embed=embed)
 
@@ -259,45 +211,86 @@ async def matches(ctx):
     for a,b,map,w,score,mvp in rows:
         embed.add_field(
             name=f"{a} vs {b}",
-            value=f"🗺 {map} | 🏆 {w} | {score} | MVP <@{mvp}>",
+            value=f"{map} | {w} won | {score} | MVP <@{mvp}>",
             inline=False
         )
 
     await ctx.send(embed=embed)
 
 # =========================
-# START MATCH
+# ADMIN CHECK
+# =========================
+def admin(ctx):
+    return ctx.author.guild_permissions.administrator
+
+# =========================
+# ADMIN COMMANDS
+# =========================
+@bot.command()
+async def addplayer(ctx, team, user: discord.Member):
+    if not admin(ctx):
+        return await ctx.send("❌ Admin only")
+
+    team = team.upper()
+    uid = str(user.id)
+
+    c.execute("SELECT members FROM teams WHERE name=?", (team,))
+    m = clean(c.fetchone()[0])
+
+    if uid not in m and len(m) < 5:
+        m.append(uid)
+
+    c.execute("UPDATE teams SET members=? WHERE name=?",
+              (",".join(m), team))
+    conn.commit()
+
+    await ctx.send("✅ Added player")
+
+@bot.command()
+async def removeplayer(ctx, team, user: discord.Member):
+    if not admin(ctx):
+        return await ctx.send("❌ Admin only")
+
+    team = team.upper()
+    uid = str(user.id)
+
+    c.execute("SELECT members FROM teams WHERE name=?", (team,))
+    m = clean(c.fetchone()[0])
+
+    if uid in m:
+        m.remove(uid)
+
+    c.execute("UPDATE teams SET members=? WHERE name=?",
+              (",".join(m), team))
+    conn.commit()
+
+    await ctx.send("✅ Removed player")
+
+# =========================
+# MATCH START
 # =========================
 active_match = None
 
 @bot.command()
-async def start(ctx, a, b, map, format, note):
+async def start(ctx, a, b, map):
     global active_match
 
-    if not is_admin(ctx):
+    if not admin(ctx):
         return await ctx.send("❌ Admin only")
 
-    active_match = {
-        "a": a.upper(),
-        "b": b.upper(),
-        "map": map,
-        "format": format,
-        "note": note
-    }
+    active_match = {"a": a.upper(), "b": b.upper(), "map": map}
 
     embed = discord.Embed(title="🔥 MATCH STARTED", color=0xff0000)
-    embed.add_field(name="Teams", value=f"{a} vs {b}", inline=False)
-    embed.add_field(name="Map", value=map, inline=True)
-    embed.add_field(name="Format", value=format, inline=True)
-    embed.add_field(name="Note", value=note, inline=False)
+    embed.add_field(name="Teams", value=f"{a} vs {b}")
+    embed.add_field(name="Map", value=map)
 
     await ann(ctx.guild, embed) or await ctx.send(embed=embed)
 
 # =========================
-# WIN MATCH
+# MATCH WIN
 # =========================
 @bot.command()
-async def win(ctx, winner, score, mvp, adr, summary):
+async def win(ctx, winner, score, mvp):
     global active_match
 
     if not active_match:
@@ -322,9 +315,9 @@ async def win(ctx, winner, score, mvp, adr, summary):
     add_mvp(mvp)
 
     c.execute("""
-    INSERT INTO matches (team_a,team_b,map,winner,score,mvp,adr)
-    VALUES (?,?,?,?,?,?,?)
-    """, (a,b,active_match["map"],winner,score,mvp,adr))
+    INSERT INTO matches (team_a,team_b,map,winner,score,mvp)
+    VALUES (?,?,?,?,?,?)
+    """, (a,b,active_match["map"],winner,score,mvp))
 
     conn.commit()
 
@@ -332,15 +325,13 @@ async def win(ctx, winner, score, mvp, adr, summary):
     embed.add_field(name="Winner", value=winner)
     embed.add_field(name="Score", value=score)
     embed.add_field(name="MVP", value=f"<@{mvp}>")
-    embed.add_field(name="ADR", value=adr)
-    embed.add_field(name="Summary", value=summary)
 
     active_match = None
 
     await ann(ctx.guild, embed) or await ctx.send(embed=embed)
 
 # =========================
-# RUN
+# RUN BOT
 # =========================
 token = os.getenv("TOKEN")
 
