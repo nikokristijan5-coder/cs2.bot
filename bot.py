@@ -1,28 +1,72 @@
 import discord
 from discord.ext import commands
 import os
+import sqlite3
 import random
 
 # ------------------------
-# ENV CHECK
+# SETUP
 # ------------------------
 print("ENV CHECK:", os.environ.get("TOKEN", "NOT FOUND"))
 
-# ------------------------
-# INTENTS
-# ------------------------
 intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ------------------------
-# DATABASE (IN MEMORY)
+# DATABASE
 # ------------------------
-teams = {"A": [], "B": []}
-player_elo = {}
-player_wins = {}
-player_losses = {}
+conn = sqlite3.connect("cs2.db")
+c = conn.cursor()
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS players (
+    id TEXT PRIMARY KEY,
+    elo INTEGER DEFAULT 1000,
+    wins INTEGER DEFAULT 0,
+    losses INTEGER DEFAULT 0
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS teams (
+    name TEXT,
+    owner TEXT,
+    members TEXT
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS match (
+    team_a TEXT,
+    team_b TEXT,
+    active INTEGER
+)
+""")
+
+conn.commit()
+
+# ------------------------
+# HELPERS
+# ------------------------
+def get_player(uid):
+    c.execute("SELECT * FROM players WHERE id=?", (uid,))
+    return c.fetchone()
+
+def create_player(uid):
+    if not get_player(uid):
+        c.execute("INSERT INTO players (id, elo, wins, losses) VALUES (?,1000,0,0)", (uid,))
+        conn.commit()
+
+def get_team(name):
+    c.execute("SELECT * FROM teams WHERE name=?", (name,))
+    return c.fetchone()
+
+def save_team(name, owner, members):
+    c.execute("INSERT INTO teams (name, owner, members) VALUES (?,?,?)",
+              (name, owner, ",".join(members)))
+    conn.commit()
 
 # ------------------------
 # READY
@@ -32,146 +76,160 @@ async def on_ready():
     print(f"BOT ONLINE: {bot.user}")
 
 # ------------------------
-# COMMAND PROCESS FIX
-# ------------------------
-@bot.event
-async def on_message(message):
-    if message.author == bot.user:
-        return
-    await bot.process_commands(message)
-
-# ------------------------
-# PING
+# CREATE TEAM
 # ------------------------
 @bot.command()
-async def ping(ctx):
-    await ctx.send("Pong!")
+async def create(ctx, name):
+    name = name.upper()
+    uid = str(ctx.author.id)
+
+    if get_team(name):
+        await ctx.send("❌ Team already exists")
+        return
+
+    save_team(name, uid, [uid])
+    await ctx.send(f"🏆 Team {name} created by {ctx.author.name}")
 
 # ------------------------
 # JOIN TEAM
 # ------------------------
 @bot.command()
-async def join(ctx, team):
-    team = team.upper()
-    user = str(ctx.author.id)
+async def join(ctx, name):
+    name = name.upper()
+    uid = str(ctx.author.id)
 
-    if team not in teams:
-        await ctx.send("❌ Team mora biti A ili B")
+    team = get_team(name)
+
+    if not team:
+        await ctx.send("❌ Team not found")
         return
 
-    # remove from other team
-    for t in teams:
-        if user in teams[t]:
-            teams[t].remove(user)
+    members = team[2].split(",") if team[2] else []
 
-    teams[team].append(user)
+    if uid in members:
+        await ctx.send("⚠️ Already in team")
+        return
 
-    # init player
-    if user not in player_elo:
-        player_elo[user] = 1000
-        player_wins[user] = 0
-        player_losses[user] = 0
+    if len(members) >= 5:
+        await ctx.send("❌ Team full (5/5)")
+        return
 
-    await ctx.send(f"🎮 {ctx.author.name} joined team {team}")
+    members.append(uid)
 
-# ------------------------
-# LEAVE
-# ------------------------
-@bot.command()
-async def leave(ctx):
-    user = str(ctx.author.id)
+    c.execute("UPDATE teams SET members=? WHERE name=?",
+              (",".join(members), name))
+    conn.commit()
 
-    for t in teams:
-        if user in teams[t]:
-            teams[t].remove(user)
-
-    await ctx.send(f"🚪 {ctx.author.name} left the match.")
+    await ctx.send(f"🎮 {ctx.author.name} joined {name}")
 
 # ------------------------
-# TEAMS
+# START MATCH
 # ------------------------
 @bot.command()
-async def teams(ctx):
+async def start(ctx, team_a, team_b):
+    team_a = team_a.upper()
+    team_b = team_b.upper()
 
-    def format_team(team):
-        return [f"<@{u}>" for u in teams[team]]
+    a = get_team(team_a)
+    b = get_team(team_b)
 
-    await ctx.send(
-        f"🎮 TEAM A: {format_team('A')}\n"
-        f"🎮 TEAM B: {format_team('B')}"
-    )
+    if not a or not b:
+        await ctx.send("❌ One of teams doesn't exist")
+        return
+
+    c.execute("DELETE FROM match")
+    c.execute("INSERT INTO match VALUES (?,?,1)", (team_a, team_b))
+    conn.commit()
+
+    msg = f"🔥 MATCH STARTED!\n\n"
+    msg += f"TEAM A: {team_a}\n"
+    msg += f"TEAM B: {team_b}\n\n"
+    msg += "Use !win A or !win B"
+
+    await ctx.send(msg)
 
 # ------------------------
-# WIN SYSTEM (ELO FIXED)
+# WIN SYSTEM
 # ------------------------
 @bot.command()
 async def win(ctx, team):
     team = team.upper()
 
-    if team not in teams:
-        await ctx.send("❌ Team mora biti A ili B")
+    c.execute("SELECT * FROM match WHERE active=1")
+    match = c.fetchone()
+
+    if not match:
+        await ctx.send("❌ No active match")
         return
 
-    winner = teams[team]
-    loser = teams["B" if team == "A" else "A"]
+    team_a, team_b = match[0], match[1]
 
-    for u in winner:
-        player_elo[u] = player_elo.get(u, 1000) + 25
-        player_wins[u] = player_wins.get(u, 0) + 1
+    winner = team_a if team == "A" else team_b
+    loser = team_b if team == "A" else team_a
 
-    for u in loser:
-        player_elo[u] = player_elo.get(u, 1000) - 25
-        player_losses[u] = player_losses.get(u, 0) + 1
+    # update players in winner team
+    for tname in [winner]:
+        c.execute("SELECT members FROM teams WHERE name=?", (tname,))
+        members = c.fetchone()[0].split(",")
 
-    await ctx.send(f"🏆 Team {team} WON! ELO updated.")
+        for m in members:
+            create_player(m)
+            c.execute("UPDATE players SET elo = elo + 25, wins = wins + 1 WHERE id=?", (m,))
+
+    # losers
+    for tname in [loser]:
+        c.execute("SELECT members FROM teams WHERE name=?", (tname,))
+        members = c.fetchone()[0].split(",")
+
+        for m in members:
+            create_player(m)
+            c.execute("UPDATE players SET elo = elo - 25, losses = losses + 1 WHERE id=?", (m,))
+
+    c.execute("DELETE FROM match")
+    conn.commit()
+
+    await ctx.send(f"🏆 TEAM {team} WON THE MATCH!")
 
 # ------------------------
 # ELO
 # ------------------------
 @bot.command()
 async def elo(ctx):
-    user = str(ctx.author.id)
-    await ctx.send(f"📊 Your ELO: {player_elo.get(user, 1000)}")
+    uid = str(ctx.author.id)
+    create_player(uid)
+
+    c.execute("SELECT elo FROM players WHERE id=?", (uid,))
+    elo = c.fetchone()[0]
+
+    await ctx.send(f"📊 Your ELO: {elo}")
 
 # ------------------------
 # STATS
 # ------------------------
 @bot.command()
 async def stats(ctx):
-    user = str(ctx.author.id)
+    uid = str(ctx.author.id)
+    create_player(uid)
 
-    await ctx.send(
-        f"📊 STATS\n"
-        f"ELO: {player_elo.get(user, 1000)}\n"
-        f"Wins: {player_wins.get(user, 0)}\n"
-        f"Losses: {player_losses.get(user, 0)}"
-    )
+    c.execute("SELECT elo,wins,losses FROM players WHERE id=?", (uid,))
+    elo,wins,losses = c.fetchone()
+
+    await ctx.send(f"📊 ELO: {elo}\nWins: {wins}\nLosses: {losses}")
 
 # ------------------------
 # LEADERBOARD
 # ------------------------
 @bot.command()
 async def leaderboard(ctx):
-    sorted_players = sorted(player_elo.items(), key=lambda x: x[1], reverse=True)
+    c.execute("SELECT id, elo FROM players ORDER BY elo DESC LIMIT 10")
+    rows = c.fetchall()
 
-    msg = "🏆 CS2 LEADERBOARD\n\n"
+    msg = "🏆 LEADERBOARD\n\n"
 
-    for i, (user, score) in enumerate(sorted_players[:10], start=1):
-        msg += f"{i}. <@{user}> — {score}\n"
+    for i,(uid,elo) in enumerate(rows,1):
+        msg += f"{i}. <@{uid}> — {elo}\n"
 
     await ctx.send(msg)
-
-# ------------------------
-# FUN
-# ------------------------
-@bot.command()
-async def map(ctx):
-    maps = ["Mirage", "Inferno", "Dust2", "Nuke", "Overpass", "Ancient"]
-    await ctx.send(f"🗺️ Map: {random.choice(maps)}")
-
-@bot.command()
-async def knife(ctx):
-    await ctx.send(f"🔪 Winner: {random.choice(['CT', 'T'])}")
 
 # ------------------------
 # START BOT
@@ -179,6 +237,6 @@ async def knife(ctx):
 token = os.getenv("TOKEN")
 
 if not token:
-    print("❌ TOKEN not found!")
+    print("❌ TOKEN missing")
 else:
     bot.run(token)
