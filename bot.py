@@ -1,6 +1,7 @@
 import discord
 from discord.ext import commands
 import os
+print("ENV CHECK:", os.environ.get("TOKEN", "NOT FOUND"))
 
 # INTENTS (bitno za komande)
 intents = discord.Intents.default()
