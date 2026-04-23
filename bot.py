@@ -11,8 +11,12 @@ print("ENV CHECK:", os.environ.get("TOKEN", "NOT FOUND"))
 intents = discord.Intents.default()
 intents.message_content = True
 
-# 🔥 important: disable default help command
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+ADMIN_ROLE = "Admin"
+ANN_CHANNEL_NAME = "announcements"
+
+active_match = None
 
 # ------------------------
 # DATABASE
@@ -38,20 +42,6 @@ CREATE TABLE IF NOT EXISTS teams (
 )
 """)
 
-c.execute("""
-CREATE TABLE IF NOT EXISTS match (
-    team_a TEXT,
-    team_b TEXT,
-    active INTEGER
-)
-""")
-
-c.execute("""
-CREATE TABLE IF NOT EXISTS checkin (
-    id TEXT PRIMARY KEY
-)
-""")
-
 conn.commit()
 
 # ------------------------
@@ -60,15 +50,37 @@ conn.commit()
 def create_player(uid):
     c.execute("SELECT * FROM players WHERE id=?", (uid,))
     if not c.fetchone():
-        c.execute("INSERT INTO players (id, acr, wins, losses) VALUES (?,1000,0,0)", (uid,))
+        c.execute("INSERT INTO players VALUES (?,1000,0,0)", (uid,))
         conn.commit()
 
 def get_team(name):
     c.execute("SELECT * FROM teams WHERE name=?", (name.upper(),))
     return c.fetchone()
 
+def get_player_team(uid):
+    c.execute("SELECT name FROM teams WHERE members LIKE ?", (f"%{uid}%",))
+    return c.fetchone()
+
 def is_admin(ctx):
-    return any(role.name == "Admin" for role in ctx.author.roles)
+    return any(role.name.lower() == ADMIN_ROLE.lower() for role in ctx.author.roles)
+
+def get_ann_channel(guild):
+    for ch in guild.text_channels:
+        if ch.name == ANN_CHANNEL_NAME:
+            return ch
+    return None
+
+def remove_from_all_teams(uid):
+    c.execute("SELECT name, members FROM teams")
+    teams = c.fetchall()
+
+    for name, members in teams:
+        m = members.split(",")
+        if uid in m:
+            m.remove(uid)
+            c.execute("UPDATE teams SET members=? WHERE name=?", (",".join(m), name))
+
+    conn.commit()
 
 # ------------------------
 # READY
@@ -78,43 +90,21 @@ async def on_ready():
     print(f"BOT ONLINE: {bot.user}")
 
 # ------------------------
-# COMMANDS MENU (REPLACEMENT FOR HELP)
+# COMMAND MENU
 # ------------------------
 @bot.command()
 async def commands(ctx):
-    embed = discord.Embed(
-        title="🎮 CS2 ESPORTS BOT COMMANDS",
-        color=0x00ffcc
-    )
+    embed = discord.Embed(title="🎮 CS2 BOT COMMANDS", color=0x00ffcc)
 
-    embed.add_field(
-        name="👥 Teams",
-        value="`!create <name>`\n`!join <team>`",
-        inline=False
-    )
-
-    embed.add_field(
-        name="⚔ Matches",
-        value="`!start <team1> <team2>` (Admin)\n`!win A/B`",
-        inline=False
-    )
-
-    embed.add_field(
-        name="📊 Stats",
-        value="`!acr` `!stats` `!leaderboard`",
-        inline=False
-    )
-
-    embed.add_field(
-        name="🎟 Tournament",
-        value="`!checkin`\n`!announce <text>` (Admin)",
-        inline=False
-    )
+    embed.add_field(name="Teams", value="!create !join !leave", inline=False)
+    embed.add_field(name="Match", value="!start !win !resetmatch", inline=False)
+    embed.add_field(name="Stats", value="!stats !acr !leaderboard", inline=False)
+    embed.add_field(name="Tournament", value="!announce (admin)", inline=False)
 
     await ctx.send(embed=embed)
 
 # ------------------------
-# CREATE TEAM
+# TEAM SYSTEM
 # ------------------------
 @bot.command()
 async def create(ctx, name):
@@ -122,36 +112,29 @@ async def create(ctx, name):
     uid = str(ctx.author.id)
 
     if get_team(name):
-        await ctx.send("❌ Team already exists")
-        return
+        return await ctx.send("❌ Team exists")
 
     c.execute("INSERT INTO teams VALUES (?,?,?,1000)", (name, uid, uid))
     conn.commit()
 
     await ctx.send(f"🏆 Team {name} created")
 
-# ------------------------
-# JOIN TEAM
-# ------------------------
 @bot.command()
 async def join(ctx, name):
     name = name.upper()
     uid = str(ctx.author.id)
 
+    if get_player_team(uid):
+        return await ctx.send("❌ Already in a team (use !leave)")
+
     team = get_team(name)
     if not team:
-        await ctx.send("❌ Team not found")
-        return
+        return await ctx.send("❌ Team not found")
 
     members = team[2].split(",")
 
-    if uid in members:
-        await ctx.send("⚠️ Already in team")
-        return
-
     if len(members) >= 5:
-        await ctx.send("❌ Team full (5/5)")
-        return
+        return await ctx.send("❌ Team full")
 
     members.append(uid)
 
@@ -161,52 +144,79 @@ async def join(ctx, name):
 
     await ctx.send(f"🎮 Joined {name}")
 
+@bot.command()
+async def leave(ctx):
+    uid = str(ctx.author.id)
+
+    if not get_player_team(uid):
+        return await ctx.send("❌ Not in team")
+
+    remove_from_all_teams(uid)
+    await ctx.send("🚪 Left team")
+
 # ------------------------
-# START MATCH (ADMIN ONLY)
+# STATS
+# ------------------------
+@bot.command()
+async def stats(ctx):
+    uid = str(ctx.author.id)
+    create_player(uid)
+
+    c.execute("SELECT acr,wins,losses FROM players WHERE id=?", (uid,))
+    acr, w, l = c.fetchone()
+
+    embed = discord.Embed(title="📊 STATS", color=0x00ffcc)
+    embed.add_field(name="ACR", value=acr)
+    embed.add_field(name="Wins", value=w)
+    embed.add_field(name="Losses", value=l)
+
+    await ctx.send(embed=embed)
+
+# ------------------------
+# MATCH SYSTEM
 # ------------------------
 @bot.command()
 async def start(ctx, a, b):
+    global active_match
+
     if not is_admin(ctx):
-        await ctx.send("❌ Admin only")
-        return
+        return await ctx.send("❌ Admin only")
+
+    if active_match:
+        return await ctx.send("❌ Match already active")
 
     a = a.upper()
     b = b.upper()
 
     if not get_team(a) or not get_team(b):
-        await ctx.send("❌ Team missing")
-        return
+        return await ctx.send("❌ Missing team")
 
-    c.execute("DELETE FROM match")
-    c.execute("INSERT INTO match VALUES (?,?,1)", (a, b))
-    conn.commit()
+    active_match = {"a": a, "b": b, "active": True}
+
+    channel = get_ann_channel(ctx.guild)
 
     embed = discord.Embed(
         title="🔥 MATCH STARTED",
-        description=f"**{a} vs {b}**",
+        description=f"{a} vs {b}",
         color=0xff0000
     )
 
-    await ctx.send(embed=embed)
+    await (channel.send(embed=embed) if channel else ctx.send(embed=embed))
 
-# ------------------------
-# WIN SYSTEM
-# ------------------------
 @bot.command()
-async def win(ctx, side):
-    side = side.upper()
+async def win(ctx, side, score, mvp, adr):
+    global active_match
 
-    c.execute("SELECT * FROM match WHERE active=1")
-    m = c.fetchone()
+    if not active_match:
+        return await ctx.send("❌ No match")
 
-    if not m:
-        await ctx.send("❌ No active match")
-        return
+    if not active_match["active"]:
+        return await ctx.send("❌ Match already finished")
 
-    a, b = m[0], m[1]
+    a, b = active_match["a"], active_match["b"]
 
-    winner = a if side == "A" else b
-    loser = b if side == "A" else a
+    winner = a if side.upper() == "A" else b
+    loser = b if winner == a else a
 
     def update(team, win):
         c.execute("SELECT members FROM teams WHERE name=?", (team,))
@@ -216,58 +226,45 @@ async def win(ctx, side):
             create_player(m)
 
             if win:
-                c.execute("UPDATE players SET acr = acr + 25, wins = wins + 1 WHERE id=?", (m,))
+                c.execute("UPDATE players SET acr=acr+25,wins=wins+1 WHERE id=?", (m,))
             else:
-                c.execute("UPDATE players SET acr = acr - 25, losses = losses + 1 WHERE id=?", (m,))
+                c.execute("UPDATE players SET acr=acr-25,losses=losses+1 WHERE id=?", (m,))
 
     update(winner, True)
     update(loser, False)
-
     conn.commit()
 
-    await ctx.send(f"🏆 {winner} WON THE MATCH!")
+    active_match["active"] = False
+
+    c.execute("SELECT members FROM teams WHERE name=?", (winner,))
+    win_members = c.fetchone()[0].split(",")
+
+    c.execute("SELECT members FROM teams WHERE name=?", (loser,))
+    lose_members = c.fetchone()[0].split(",")
+
+    embed = discord.Embed(title="🏆 MATCH RESULT", color=0x00ff00)
+    embed.add_field(name="Winner", value=winner)
+    embed.add_field(name="Score", value=score)
+    embed.add_field(name="MVP", value=f"<@{mvp}>")
+    embed.add_field(name="ADR", value=adr)
+    embed.add_field(name="Winner team", value="\n".join([f"<@{x}>" for x in win_members]))
+    embed.add_field(name="Loser team", value="\n".join([f"<@{x}>" for x in lose_members]))
+
+    channel = get_ann_channel(ctx.guild)
+    await (channel.send(embed=embed) if channel else ctx.send(embed=embed))
 
 # ------------------------
-# ACR
-# ------------------------
-@bot.command()
-async def acr(ctx):
-    uid = str(ctx.author.id)
-    create_player(uid)
-
-    c.execute("SELECT acr FROM players WHERE id=?", (uid,))
-    val = c.fetchone()[0]
-
-    await ctx.send(f"📊 ACR: {val}")
-
-# ------------------------
-# CHECKIN
-# ------------------------
-@bot.command()
-async def checkin(ctx):
-    uid = str(ctx.author.id)
-
-    c.execute("INSERT OR IGNORE INTO checkin VALUES (?)", (uid,))
-    conn.commit()
-
-    await ctx.send("✅ Checked in")
-
-# ------------------------
-# ANNOUNCE (ADMIN)
+# RESET MATCH
 # ------------------------
 @bot.command()
-async def announce(ctx, *, text):
+async def resetmatch(ctx):
+    global active_match
+
     if not is_admin(ctx):
-        await ctx.send("❌ Admin only")
-        return
+        return await ctx.send("❌ Admin only")
 
-    embed = discord.Embed(
-        title="📢 ANNOUNCEMENT",
-        description=text,
-        color=0x00ff00
-    )
-
-    await ctx.send(embed=embed)
+    active_match = None
+    await ctx.send("🔄 Match reset")
 
 # ------------------------
 # LEADERBOARD
@@ -277,31 +274,40 @@ async def leaderboard(ctx):
     c.execute("SELECT name, acr FROM teams ORDER BY acr DESC")
     teams = c.fetchall()
 
-    embed = discord.Embed(
-        title="🏆 TEAM LEADERBOARD (ACR)",
-        color=0xFFD700
-    )
+    embed = discord.Embed(title="🏆 LEADERBOARD", color=0xFFD700)
 
     for i, (name, acr) in enumerate(teams, 1):
         c.execute("SELECT members FROM teams WHERE name=?", (name,))
         members = c.fetchone()[0].split(",")
 
-        members_list = "\n".join([f"<@{m}>" for m in members])
-
         embed.add_field(
-            name=f"{i}. {name} — {acr} ACR",
-            value=members_list,
+            name=f"{i}. {name} ({acr} ACR)",
+            value="\n".join([f"<@{m}>" for m in members]),
             inline=False
         )
 
     await ctx.send(embed=embed)
 
 # ------------------------
+# ANNOUNCE
+# ------------------------
+@bot.command()
+async def announce(ctx, *, text):
+    if not is_admin(ctx):
+        return await ctx.send("❌ Admin only")
+
+    channel = get_ann_channel(ctx.guild)
+
+    embed = discord.Embed(title="📢 ANNOUNCEMENT", description=text, color=0x00ff00)
+
+    await (channel.send(embed=embed) if channel else ctx.send(embed=embed))
+
+# ------------------------
 # START BOT
 # ------------------------
 token = os.getenv("TOKEN")
 
-if not token:
-    print("❌ TOKEN missing")
-else:
+if token:
     bot.run(token)
+else:
+    print("❌ TOKEN missing")
