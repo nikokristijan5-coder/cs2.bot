@@ -4,12 +4,12 @@ import os
 import random
 
 # ------------------------
-# DEBUG ENV CHECK
+# ENV CHECK
 # ------------------------
 print("ENV CHECK:", os.environ.get("TOKEN", "NOT FOUND"))
 
 # ------------------------
-# INTENTS (OBAVEZNO)
+# INTENTS
 # ------------------------
 intents = discord.Intents.default()
 intents.message_content = True
@@ -17,22 +17,22 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ------------------------
-# MEMORY SYSTEM
+# DATABASE (IN MEMORY)
 # ------------------------
 teams = {"A": [], "B": []}
-elo = {}
-wins = {}
-losses = {}
+player_elo = {}
+player_wins = {}
+player_losses = {}
 
 # ------------------------
-# BOT READY
+# READY
 # ------------------------
 @bot.event
 async def on_ready():
     print(f"BOT ONLINE: {bot.user}")
 
 # ------------------------
-# IMPORTANT FIX (COMMAND PROCESSING)
+# COMMAND PROCESS FIX
 # ------------------------
 @bot.event
 async def on_message(message):
@@ -41,7 +41,7 @@ async def on_message(message):
     await bot.process_commands(message)
 
 # ------------------------
-# PING TEST
+# PING
 # ------------------------
 @bot.command()
 async def ping(ctx):
@@ -59,21 +59,23 @@ async def join(ctx, team):
         await ctx.send("❌ Team mora biti A ili B")
         return
 
+    # remove from other team
     for t in teams:
         if user in teams[t]:
             teams[t].remove(user)
 
     teams[team].append(user)
 
-    if user not in elo:
-        elo[user] = 1000
-        wins[user] = 0
-        losses[user] = 0
+    # init player
+    if user not in player_elo:
+        player_elo[user] = 1000
+        player_wins[user] = 0
+        player_losses[user] = 0
 
     await ctx.send(f"🎮 {ctx.author.name} joined team {team}")
 
 # ------------------------
-# LEAVE TEAM
+# LEAVE
 # ------------------------
 @bot.command()
 async def leave(ctx):
@@ -86,19 +88,21 @@ async def leave(ctx):
     await ctx.send(f"🚪 {ctx.author.name} left the match.")
 
 # ------------------------
-# TEAMS VIEW
+# TEAMS
 # ------------------------
 @bot.command()
 async def teams(ctx):
-    def fmt(team):
+
+    def format_team(team):
         return [f"<@{u}>" for u in teams[team]]
 
     await ctx.send(
-        f"🎮 TEAM A: {fmt('A')}\n🎮 TEAM B: {fmt('B')}"
+        f"🎮 TEAM A: {format_team('A')}\n"
+        f"🎮 TEAM B: {format_team('B')}"
     )
 
 # ------------------------
-# WIN SYSTEM (ELO UPDATE)
+# WIN SYSTEM (ELO FIXED)
 # ------------------------
 @bot.command()
 async def win(ctx, team):
@@ -112,22 +116,22 @@ async def win(ctx, team):
     loser = teams["B" if team == "A" else "A"]
 
     for u in winner:
-        elo[u] = elo.get(u, 1000) + 25
-        wins[u] = wins.get(u, 0) + 1
+        player_elo[u] = player_elo.get(u, 1000) + 25
+        player_wins[u] = player_wins.get(u, 0) + 1
 
     for u in loser:
-        elo[u] = elo.get(u, 1000) - 25
-        losses[u] = losses.get(u, 0) + 1
+        player_elo[u] = player_elo.get(u, 1000) - 25
+        player_losses[u] = player_losses.get(u, 0) + 1
 
     await ctx.send(f"🏆 Team {team} WON! ELO updated.")
 
 # ------------------------
-# ELO CHECK
+# ELO
 # ------------------------
 @bot.command()
 async def elo(ctx):
     user = str(ctx.author.id)
-    await ctx.send(f"📊 Your ELO: {elo.get(user, 1000)}")
+    await ctx.send(f"📊 Your ELO: {player_elo.get(user, 1000)}")
 
 # ------------------------
 # STATS
@@ -138,9 +142,9 @@ async def stats(ctx):
 
     await ctx.send(
         f"📊 STATS\n"
-        f"ELO: {elo.get(user, 1000)}\n"
-        f"Wins: {wins.get(user, 0)}\n"
-        f"Losses: {losses.get(user, 0)}"
+        f"ELO: {player_elo.get(user, 1000)}\n"
+        f"Wins: {player_wins.get(user, 0)}\n"
+        f"Losses: {player_losses.get(user, 0)}"
     )
 
 # ------------------------
@@ -148,17 +152,17 @@ async def stats(ctx):
 # ------------------------
 @bot.command()
 async def leaderboard(ctx):
-    sorted_elo = sorted(elo.items(), key=lambda x: x[1], reverse=True)
+    sorted_players = sorted(player_elo.items(), key=lambda x: x[1], reverse=True)
 
     msg = "🏆 CS2 LEADERBOARD\n\n"
 
-    for i, (user, score) in enumerate(sorted_elo[:10], start=1):
+    for i, (user, score) in enumerate(sorted_players[:10], start=1):
         msg += f"{i}. <@{user}> — {score}\n"
 
     await ctx.send(msg)
 
 # ------------------------
-# FUN COMMANDS
+# FUN
 # ------------------------
 @bot.command()
 async def map(ctx):
@@ -167,15 +171,14 @@ async def map(ctx):
 
 @bot.command()
 async def knife(ctx):
-    winner = random.choice(["CT", "T"])
-    await ctx.send(f"🔪 Knife round winner: {winner}")
+    await ctx.send(f"🔪 Winner: {random.choice(['CT', 'T'])}")
 
 # ------------------------
 # START BOT
 # ------------------------
 token = os.getenv("TOKEN")
 
-if token is None:
-    print("❌ TOKEN not found in environment variables!")
+if not token:
+    print("❌ TOKEN not found!")
 else:
     bot.run(token)
