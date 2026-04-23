@@ -11,9 +11,8 @@ print("ENV CHECK:", os.environ.get("TOKEN", "NOT FOUND"))
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-ADMIN_ROLE = "Admin"
+# 🔥 important: disable default help command
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # ------------------------
 # DATABASE
@@ -58,59 +57,59 @@ conn.commit()
 # ------------------------
 # HELPERS
 # ------------------------
-def is_admin(ctx):
-    return any(role.name == ADMIN_ROLE for role in ctx.author.roles)
-
-def get_team(name):
-    c.execute("SELECT * FROM teams WHERE name=?", (name.upper(),))
-    return c.fetchone()
-
-def update_team_acr(team):
-    c.execute("SELECT members FROM teams WHERE name=?", (team,))
-    members = c.fetchone()[0].split(",")
-
-    total = 0
-    for m in members:
-        c.execute("SELECT acr FROM players WHERE id=?", (m,))
-        r = c.fetchone()
-        if r:
-            total += r[0]
-
-    avg = int(total / len(members)) if members else 1000
-
-    c.execute("UPDATE teams SET acr=? WHERE name=?", (avg, team))
-    conn.commit()
-
-# ------------------------
-# PLAYER INIT
-# ------------------------
 def create_player(uid):
     c.execute("SELECT * FROM players WHERE id=?", (uid,))
     if not c.fetchone():
         c.execute("INSERT INTO players (id, acr, wins, losses) VALUES (?,1000,0,0)", (uid,))
         conn.commit()
 
+def get_team(name):
+    c.execute("SELECT * FROM teams WHERE name=?", (name.upper(),))
+    return c.fetchone()
+
+def is_admin(ctx):
+    return any(role.name == "Admin" for role in ctx.author.roles)
+
 # ------------------------
-# HELP COMMAND
+# READY
+# ------------------------
+@bot.event
+async def on_ready():
+    print(f"BOT ONLINE: {bot.user}")
+
+# ------------------------
+# COMMANDS MENU (REPLACEMENT FOR HELP)
 # ------------------------
 @bot.command()
-async def help(ctx):
+async def commands(ctx):
     embed = discord.Embed(
         title="🎮 CS2 ESPORTS BOT COMMANDS",
         color=0x00ffcc
     )
 
-    embed.add_field(name="👥 Teams",
-        value="`!create <name>`\n`!join <team>`", inline=False)
+    embed.add_field(
+        name="👥 Teams",
+        value="`!create <name>`\n`!join <team>`",
+        inline=False
+    )
 
-    embed.add_field(name="⚔ Matches",
-        value="`!start <team1> <team2>`\n`!win A/B`", inline=False)
+    embed.add_field(
+        name="⚔ Matches",
+        value="`!start <team1> <team2>` (Admin)\n`!win A/B`",
+        inline=False
+    )
 
-    embed.add_field(name="📊 Stats",
-        value="`!acr` `!stats` `!leaderboard`", inline=False)
+    embed.add_field(
+        name="📊 Stats",
+        value="`!acr` `!stats` `!leaderboard`",
+        inline=False
+    )
 
-    embed.add_field(name="🎟 Tournament",
-        value="`!checkin`\n`!announce <text>` (Admin)", inline=False)
+    embed.add_field(
+        name="🎟 Tournament",
+        value="`!checkin`\n`!announce <text>` (Admin)",
+        inline=False
+    )
 
     await ctx.send(embed=embed)
 
@@ -123,7 +122,7 @@ async def create(ctx, name):
     uid = str(ctx.author.id)
 
     if get_team(name):
-        await ctx.send("❌ Team exists")
+        await ctx.send("❌ Team already exists")
         return
 
     c.execute("INSERT INTO teams VALUES (?,?,?,1000)", (name, uid, uid))
@@ -163,7 +162,7 @@ async def join(ctx, name):
     await ctx.send(f"🎮 Joined {name}")
 
 # ------------------------
-# START MATCH
+# START MATCH (ADMIN ONLY)
 # ------------------------
 @bot.command()
 async def start(ctx, a, b):
@@ -201,7 +200,7 @@ async def win(ctx, side):
     m = c.fetchone()
 
     if not m:
-        await ctx.send("❌ No match")
+        await ctx.send("❌ No active match")
         return
 
     a, b = m[0], m[1]
@@ -220,8 +219,6 @@ async def win(ctx, side):
                 c.execute("UPDATE players SET acr = acr + 25, wins = wins + 1 WHERE id=?", (m,))
             else:
                 c.execute("UPDATE players SET acr = acr - 25, losses = losses + 1 WHERE id=?", (m,))
-
-        update_team_acr(team)
 
     update(winner, True)
     update(loser, False)
@@ -253,10 +250,10 @@ async def checkin(ctx):
     c.execute("INSERT OR IGNORE INTO checkin VALUES (?)", (uid,))
     conn.commit()
 
-    await ctx.send("✅ Checked in for tournament")
+    await ctx.send("✅ Checked in")
 
 # ------------------------
-# ANNOUNCE
+# ANNOUNCE (ADMIN)
 # ------------------------
 @bot.command()
 async def announce(ctx, *, text):
@@ -265,7 +262,7 @@ async def announce(ctx, *, text):
         return
 
     embed = discord.Embed(
-        title="📢 TOURNAMENT ANNOUNCEMENT",
+        title="📢 ANNOUNCEMENT",
         description=text,
         color=0x00ff00
     )
@@ -273,7 +270,7 @@ async def announce(ctx, *, text):
     await ctx.send(embed=embed)
 
 # ------------------------
-# LEADERBOARD (FIXED)
+# LEADERBOARD
 # ------------------------
 @bot.command()
 async def leaderboard(ctx):
@@ -289,18 +286,18 @@ async def leaderboard(ctx):
         c.execute("SELECT members FROM teams WHERE name=?", (name,))
         members = c.fetchone()[0].split(",")
 
-        mentions = "\n".join([f"<@{m}>" for m in members])
+        members_list = "\n".join([f"<@{m}>" for m in members])
 
         embed.add_field(
             name=f"{i}. {name} — {acr} ACR",
-            value=mentions,
+            value=members_list,
             inline=False
         )
 
     await ctx.send(embed=embed)
 
 # ------------------------
-# START
+# START BOT
 # ------------------------
 token = os.getenv("TOKEN")
 
