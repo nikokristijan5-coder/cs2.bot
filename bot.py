@@ -6,15 +6,13 @@ import sqlite3
 # ------------------------
 # SETUP
 # ------------------------
-print("ENV CHECK:", os.environ.get("TOKEN", "NOT FOUND"))
-
 intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 ADMIN_ROLE = "Admin"
-ANN_CHANNEL_NAME = "announcements"
+ANN_CHANNEL = "announcements"
 
 active_match = None
 
@@ -66,7 +64,7 @@ def is_admin(ctx):
 
 def get_ann_channel(guild):
     for ch in guild.text_channels:
-        if ch.name == ANN_CHANNEL_NAME:
+        if ch.name == ANN_CHANNEL:
             return ch
     return None
 
@@ -96,10 +94,29 @@ async def on_ready():
 async def commands(ctx):
     embed = discord.Embed(title="🎮 CS2 BOT COMMANDS", color=0x00ffcc)
 
-    embed.add_field(name="Teams", value="!create !join !leave", inline=False)
-    embed.add_field(name="Match", value="!start !win !resetmatch", inline=False)
-    embed.add_field(name="Stats", value="!stats !acr !leaderboard", inline=False)
-    embed.add_field(name="Tournament", value="!announce (admin)", inline=False)
+    embed.add_field(
+        name="👥 Teams",
+        value="!create <name>\n!join <name>\n!leave",
+        inline=False
+    )
+
+    embed.add_field(
+        name="⚔ Match",
+        value="!start <A> <B> (Admin)\n!win A/B <score> <mvpID> <adr>\n!resetmatch (Admin)",
+        inline=False
+    )
+
+    embed.add_field(
+        name="📊 Stats",
+        value="!stats\n!leaderboard",
+        inline=False
+    )
+
+    embed.add_field(
+        name="📢 Other",
+        value="!announce (Admin)",
+        inline=False
+    )
 
     await ctx.send(embed=embed)
 
@@ -125,7 +142,7 @@ async def join(ctx, name):
     uid = str(ctx.author.id)
 
     if get_player_team(uid):
-        return await ctx.send("❌ Already in a team (use !leave)")
+        return await ctx.send("❌ Already in a team")
 
     team = get_team(name)
     if not team:
@@ -134,7 +151,7 @@ async def join(ctx, name):
     members = team[2].split(",")
 
     if len(members) >= 5:
-        return await ctx.send("❌ Team full")
+        return await ctx.send("❌ Team full (5 max)")
 
     members.append(uid)
 
@@ -173,7 +190,7 @@ async def stats(ctx):
     await ctx.send(embed=embed)
 
 # ------------------------
-# MATCH SYSTEM
+# MATCH START
 # ------------------------
 @bot.command()
 async def start(ctx, a, b):
@@ -183,13 +200,12 @@ async def start(ctx, a, b):
         return await ctx.send("❌ Admin only")
 
     if active_match:
-        return await ctx.send("❌ Match already active")
+        return await ctx.send("❌ Match already running")
 
-    a = a.upper()
-    b = b.upper()
+    a, b = a.upper(), b.upper()
 
     if not get_team(a) or not get_team(b):
-        return await ctx.send("❌ Missing team")
+        return await ctx.send("❌ Team missing")
 
     active_match = {"a": a, "b": b, "active": True}
 
@@ -203,15 +219,15 @@ async def start(ctx, a, b):
 
     await (channel.send(embed=embed) if channel else ctx.send(embed=embed))
 
+# ------------------------
+# WIN SYSTEM (FULL REPORT)
+# ------------------------
 @bot.command()
 async def win(ctx, side, score, mvp, adr):
     global active_match
 
-    if not active_match:
-        return await ctx.send("❌ No match")
-
-    if not active_match["active"]:
-        return await ctx.send("❌ Match already finished")
+    if not active_match or not active_match["active"]:
+        return await ctx.send("❌ No active match")
 
     a, b = active_match["a"], active_match["b"]
 
@@ -237,18 +253,18 @@ async def win(ctx, side, score, mvp, adr):
     active_match["active"] = False
 
     c.execute("SELECT members FROM teams WHERE name=?", (winner,))
-    win_members = c.fetchone()[0].split(",")
+    w_members = c.fetchone()[0].split(",")
 
     c.execute("SELECT members FROM teams WHERE name=?", (loser,))
-    lose_members = c.fetchone()[0].split(",")
+    l_members = c.fetchone()[0].split(",")
 
     embed = discord.Embed(title="🏆 MATCH RESULT", color=0x00ff00)
     embed.add_field(name="Winner", value=winner)
     embed.add_field(name="Score", value=score)
     embed.add_field(name="MVP", value=f"<@{mvp}>")
     embed.add_field(name="ADR", value=adr)
-    embed.add_field(name="Winner team", value="\n".join([f"<@{x}>" for x in win_members]))
-    embed.add_field(name="Loser team", value="\n".join([f"<@{x}>" for x in lose_members]))
+    embed.add_field(name="Winner Team", value="\n".join([f"<@{x}>" for x in w_members]))
+    embed.add_field(name="Loser Team", value="\n".join([f"<@{x}>" for x in l_members]))
 
     channel = get_ann_channel(ctx.guild)
     await (channel.send(embed=embed) if channel else ctx.send(embed=embed))
