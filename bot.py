@@ -70,11 +70,12 @@ def get_team(uid):
 def admin(ctx):
     return ctx.author.guild_permissions.administrator
 
-def announce(ctx, embed):
+async def announce(ctx, embed):
     kanal = discord.utils.get(ctx.guild.text_channels, name=ANN_CHANNEL)
     if kanal:
-        return kanal.send(embed=embed)
-    return ctx.send(embed=embed)
+        await kanal.send(embed=embed)
+    else:
+        await ctx.send(embed=embed)
 
 # =========================
 # READY
@@ -174,15 +175,32 @@ async def stats(ctx, member: discord.Member = None):
 
     await ctx.send(embed=embed)
 
+# ✅ FIXED LEADERBOARD
 @bot.command()
 async def leaderboard(ctx):
-    c.execute("SELECT id,acr FROM igraci ORDER BY acr DESC LIMIT 10")
+    c.execute("SELECT id, acr FROM igraci ORDER BY acr DESC")
     rows = c.fetchall()
 
     embed = discord.Embed(title="🏆 Leaderboard", color=0xf1c40f)
 
-    for i,(uid,a) in enumerate(rows,1):
-        embed.add_field(name=f"{i}. <@{uid}>", value=f"{a} ACR", inline=False)
+    seen = set()
+    mjesto = 1
+
+    for uid, acr in rows:
+        if uid in seen:
+            continue
+        seen.add(uid)
+
+        embed.add_field(
+            name=f"{mjesto}. <@{uid}>",
+            value=f"{acr} ACR",
+            inline=False
+        )
+
+        mjesto += 1
+
+        if mjesto > 10:
+            break
 
     await ctx.send(embed=embed)
 
@@ -204,11 +222,67 @@ async def admincommands(ctx):
 
     embed.add_field(
         name="ACR sistem",
-        value="!acr @igrac kills deaths assists adr hs util flash\nPrimjer:\n!acr @niko 25 18 5 90 40 120 3",
+        value="!acr @igrac kills deaths assists adr hs util flash",
+        inline=False
+    )
+
+    embed.add_field(
+        name="Upravljanje timovima",
+        value="!addplayer @igrac <tim>\n!removeplayer @igrac",
         inline=False
     )
 
     await ctx.send(embed=embed)
+
+# =========================
+# ADMIN TEAM CONTROL
+# =========================
+@bot.command()
+async def addplayer(ctx, member: discord.Member, team_name):
+    if not admin(ctx):
+        return await ctx.send("❌ Samo admin.")
+
+    uid = str(member.id)
+    team_name = team_name.upper()
+
+    t = tim(team_name)
+    if not t:
+        return await ctx.send("❌ Tim ne postoji.")
+
+    if u_timu(uid):
+        return await ctx.send("❌ Igrač je već u timu.")
+
+    clanovi = lista(t[1])
+
+    if len(clanovi) >= 5:
+        return await ctx.send("❌ Tim je pun.")
+
+    clanovi.append(uid)
+
+    c.execute("UPDATE timovi SET clanovi=? WHERE ime=?",
+              (",".join(clanovi), team_name))
+    conn.commit()
+
+    await ctx.send(f"✅ {member.mention} dodan u tim {team_name}")
+
+@bot.command()
+async def removeplayer(ctx, member: discord.Member):
+    if not admin(ctx):
+        return await ctx.send("❌ Samo admin.")
+
+    uid = str(member.id)
+
+    c.execute("SELECT ime, clanovi FROM timovi")
+    for ime, clanovi in c.fetchall():
+        l = lista(clanovi)
+        if uid in l:
+            l.remove(uid)
+            c.execute("UPDATE timovi SET clanovi=? WHERE ime=?",
+                      (",".join(l), ime))
+            conn.commit()
+            return await ctx.send(f"🚪 {member.mention} uklonjen iz tima {ime}")
+
+    await ctx.send("❌ Igrač nije u timu.")
 
 # =========================
 # MATCH
@@ -241,7 +315,6 @@ async def win(ctx, pobjednik, rezultat, mvp):
     mvp = str(mvp)
     igrac(mvp)
     c.execute("UPDATE igraci SET mvp=mvp+1 WHERE id=?", (mvp,))
-
     conn.commit()
 
     embed = discord.Embed(title="🏆 REZULTAT MEČA", color=0x2ecc71)
@@ -254,7 +327,7 @@ async def win(ctx, pobjednik, rezultat, mvp):
     await announce(ctx, embed)
 
 # =========================
-# ACR KOMANDA
+# ACR
 # =========================
 @bot.command()
 async def acr(ctx, member: discord.Member, kills: int, deaths: int, assists: int,
@@ -272,7 +345,7 @@ async def acr(ctx, member: discord.Member, kills: int, deaths: int, assists: int
         return await ctx.send("❌ Igrač nije u timu.")
 
     if not ZADNJI_POBJEDNIK:
-        return await ctx.send("❌ Nema spremljenog meča.")
+        return await ctx.send("❌ Nema meča.")
 
     win = team == ZADNJI_POBJEDNIK
 
@@ -286,8 +359,7 @@ async def acr(ctx, member: discord.Member, kills: int, deaths: int, assists: int
         + flash * 0.3
     )
 
-    acr_change = performance + (20 if win else -10)
-    acr_change = int(acr_change)
+    acr_change = int(performance + (20 if win else -10))
 
     if win:
         c.execute("UPDATE igraci SET acr=acr+?, pobjede=pobjede+1 WHERE id=?", (acr_change, uid))
