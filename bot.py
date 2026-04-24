@@ -2,275 +2,928 @@ import discord
 from discord.ext import commands
 import os
 import sqlite3
+import random
+from datetime import datetime
 
-# =========================
-# BOT SETUP
-# =========================
+# ═══════════════════════════════════════════════
+#  POSTAVLJANJE BOTA
+# ═══════════════════════════════════════════════
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-ANN_CHANNEL = "announcements"
-AKTIVNI_MEC = None
-ZADNJI_POBJEDNIK = None
+KANAL_OBJAVE = "announcements"
 
-# =========================
-# DATABASE
-# =========================
+# ═══════════════════════════════════════════════
+#  BAZA PODATAKA
+# ═══════════════════════════════════════════════
 conn = sqlite3.connect("bot.db")
+conn.row_factory = sqlite3.Row
 c = conn.cursor()
 
-c.execute("""
+c.executescript("""
 CREATE TABLE IF NOT EXISTS igraci (
     id TEXT PRIMARY KEY,
     acr INTEGER DEFAULT 1000,
-    wins INTEGER DEFAULT 0,
-    losses INTEGER DEFAULT 0,
+    pobjede INTEGER DEFAULT 0,
+    porazi INTEGER DEFAULT 0,
     mvp INTEGER DEFAULT 0,
-    tournaments INTEGER DEFAULT 0
-)
-""")
+    turniri INTEGER DEFAULT 0,
+    tim TEXT,
+    registriran TEXT
+);
 
-c.execute("""
 CREATE TABLE IF NOT EXISTS timovi (
-    ime TEXT PRIMARY KEY,
-    clanovi TEXT
-)
-""")
+    naziv TEXT PRIMARY KEY,
+    clanovi TEXT DEFAULT '',
+    kreiran TEXT
+);
 
+CREATE TABLE IF NOT EXISTS meczevi (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tim_a TEXT,
+    tim_b TEXT,
+    mapa TEXT,
+    rezultat TEXT,
+    pobjednik TEXT,
+    gubitnik TEXT,
+    mvp_id TEXT,
+    odigrano TEXT
+);
+
+CREATE TABLE IF NOT EXISTS kazne (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    igrac_id TEXT,
+    razlog TEXT,
+    kazna INTEGER,
+    admin_id TEXT,
+    datum TEXT
+);
+""")
 conn.commit()
 
-# =========================
-# HELPERS
-# =========================
-def ensure_player(uid):
-    c.execute("SELECT * FROM igraci WHERE id=?", (uid,))
+# ═══════════════════════════════════════════════
+#  RANG SUSTAV
+# ═══════════════════════════════════════════════
+RANGOVI = [
+    (0,    "◈ Željezni",    0x7f8c8d),
+    (900,  "◈ Brončani",    0xcd6133),
+    (1050, "◈ Srebrni",     0x95a5a6),
+    (1200, "◈ Zlatni",      0xf1c40f),
+    (1400, "◈ Platinasti",  0x1abc9c),
+    (1600, "◈ Dijamantni",  0x3498db),
+    (1800, "◈ Majstorski",  0x9b59b6),
+    (2000, "◈ Elitni",      0xe74c3c),
+    (2500, "◈ Legendarni",  0xff6b35),
+]
+
+def dohvati_rang(acr: int):
+    rang = RANGOVI[0]
+    for entry in RANGOVI:
+        if acr >= entry[0]:
+            rang = entry
+    return rang[1], rang[2]
+
+def rang_naziv(acr: int) -> str:
+    return dohvati_rang(acr)[0]
+
+def rang_boja(acr: int) -> int:
+    return dohvati_rang(acr)[1]
+
+def rang_napredak(acr: int) -> str:
+    for i, (min_acr, naziv, _) in enumerate(RANGOVI):
+        if i + 1 < len(RANGOVI):
+            sljedeci_min = RANGOVI[i + 1][0]
+            if acr < sljedeci_min:
+                napredak = acr - min_acr
+                potrebno = sljedeci_min - min_acr
+                posto = int((napredak / potrebno) * 10)
+                traka = "█" * posto + "░" * (10 - posto)
+                return f"`{traka}` {napredak}/{potrebno}"
+    return "`██████████` MAX RANG"
+
+# ═══════════════════════════════════════════════
+#  POMOĆNE FUNKCIJE
+# ═══════════════════════════════════════════════
+def osiguraj_igraca(uid: str):
+    c.execute("SELECT id FROM igraci WHERE id=?", (uid,))
     if not c.fetchone():
-        c.execute("INSERT INTO igraci VALUES (?,1000,0,0,0,0)", (uid,))
+        sada = datetime.utcnow().strftime("%d.%m.%Y")
+        c.execute("INSERT INTO igraci (id, registriran) VALUES (?,?)", (uid, sada))
         conn.commit()
 
-def get_team(uid):
-    c.execute("SELECT ime, clanovi FROM timovi")
-    for ime, clanovi in c.fetchall():
-        if clanovi and uid in clanovi.split(","):
-            return ime.upper()
+def dohvati_igraca(uid: str):
+    osiguraj_igraca(uid)
+    c.execute("SELECT * FROM igraci WHERE id=?", (uid,))
+    return c.fetchone()
+
+def dohvati_tim_igraca(uid: str):
+    c.execute("SELECT naziv, clanovi FROM timovi")
+    for red in c.fetchall():
+        clanovi = red["clanovi"].split(",") if red["clanovi"] else []
+        if uid in clanovi:
+            return red["naziv"]
     return None
 
-def is_admin(ctx):
+def dohvati_clanove_tima(naziv: str):
+    c.execute("SELECT clanovi FROM timovi WHERE naziv=?", (naziv.upper(),))
+    red = c.fetchone()
+    if not red or not red["clanovi"]:
+        return []
+    return [m for m in red["clanovi"].split(",") if m]
+
+def je_admin(ctx) -> bool:
     return ctx.author.guild_permissions.administrator
 
-async def announce(ctx, embed):
-    channel = discord.utils.get(ctx.guild.text_channels, name=ANN_CHANNEL)
-    if channel:
-        await channel.send(embed=embed)
+async def objavi(ctx, embed: discord.Embed):
+    kanal = discord.utils.get(ctx.guild.text_channels, name=KANAL_OBJAVE)
+    if kanal:
+        await kanal.send(embed=embed)
     else:
         await ctx.send(embed=embed)
 
-# =========================
-# READY
-# =========================
+def spremi_mec(tim_a, tim_b, mapa, rezultat, pobjednik, gubitnik, mvp_id):
+    c.execute("""
+        INSERT INTO meczevi (tim_a, tim_b, mapa, rezultat, pobjednik, gubitnik, mvp_id, odigrano)
+        VALUES (?,?,?,?,?,?,?,?)
+    """, (tim_a, tim_b, mapa, rezultat, pobjednik, gubitnik, mvp_id,
+          datetime.utcnow().strftime("%d.%m.%Y %H:%M")))
+    c.execute("""
+        DELETE FROM meczevi WHERE id NOT IN (
+            SELECT id FROM meczevi ORDER BY id DESC LIMIT 20
+        )
+    """)
+    conn.commit()
+
+def greska_embed(poruka: str) -> discord.Embed:
+    return discord.Embed(description=f"```diff\n- {poruka}\n```", color=0xe74c3c)
+
+def uspjeh_embed(naslov: str, poruka: str = None) -> discord.Embed:
+    e = discord.Embed(title=f"✦ {naslov}", color=0x2ecc71)
+    if poruka:
+        e.description = poruka
+    return e
+
+# ═══════════════════════════════════════════════
+#  EVENTI
+# ═══════════════════════════════════════════════
 @bot.event
 async def on_ready():
-    print(f"BOT ONLINE: {bot.user}")
+    print(f"╔══════════════════════════════╗")
+    print(f"║   BOT ONLINE: {bot.user}")
+    print(f"╚══════════════════════════════╝")
+    await bot.change_presence(
+        activity=discord.Activity(type=discord.ActivityType.watching, name="CS2 | !commands")
+    )
 
-# =========================
-# PLAYER COMMANDS
-# =========================
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(embed=greska_embed(f"Nedostaje argument: {error.param.name}  •  Koristi !commands"))
+    elif isinstance(error, commands.MemberNotFound):
+        await ctx.send(embed=greska_embed("Korisnik nije pronađen."))
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send(embed=greska_embed("Neispravan tip argumenta."))
+    elif isinstance(error, commands.CommandNotFound):
+        pass
+
+@bot.event
+async def on_member_join(member):
+    uid = str(member.id)
+    osiguraj_igraca(uid)
+    kanal = discord.utils.get(member.guild.text_channels, name=KANAL_OBJAVE)
+    if kanal:
+        embed = discord.Embed(
+            title="◈ Novi Igrač",
+            description=f"**{member.display_name}** se pridružio serveru.\nDobrodošao u arenu.",
+            color=0x3498db
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.set_footer(text=f"ACR: 1000  •  {rang_naziv(1000)}")
+        await kanal.send(embed=embed)
+
+# ═══════════════════════════════════════════════
+#  TIMOVI
+# ═══════════════════════════════════════════════
 @bot.command()
-async def commands(ctx):
-    embed = discord.Embed(title="🎮 Commands", color=0x2ecc71)
-    embed.add_field(name="Team", value="!create !join !leave", inline=False)
-    embed.add_field(name="Stats", value="!stats", inline=False)
-    embed.add_field(name="Leaderboard", value="!leaderboard", inline=False)
+async def stvori(ctx, *, naziv: str):
+    uid = str(ctx.author.id)
+    naziv = naziv.upper().strip()
+
+    if len(naziv) > 20:
+        return await ctx.send(embed=greska_embed("Naziv tima ne smije biti duži od 20 znakova."))
+    if dohvati_tim_igraca(uid):
+        return await ctx.send(embed=greska_embed("Već si u timu. Izađi prvo s !izlaz"))
+
+    c.execute("SELECT naziv FROM timovi WHERE naziv=?", (naziv,))
+    if c.fetchone():
+        return await ctx.send(embed=greska_embed(f"Tim {naziv} već postoji."))
+
+    sada = datetime.utcnow().strftime("%d.%m.%Y")
+    c.execute("INSERT INTO timovi VALUES (?,?,?)", (naziv, uid, sada))
+    osiguraj_igraca(uid)
+    c.execute("UPDATE igraci SET tim=? WHERE id=?", (naziv, uid))
+    conn.commit()
+
+    embed = discord.Embed(title="◈ Tim Stvoren", color=0x2ecc71)
+    embed.add_field(name="Naziv", value=f"**{naziv}**")
+    embed.add_field(name="Kapetan", value=ctx.author.display_name)
+    embed.add_field(name="Mjesta", value="1 / 5")
+    embed.set_footer(text=f"Stvoreno {sada}")
     await ctx.send(embed=embed)
 
 @bot.command()
-async def create(ctx, name):
-    name = name.upper()
+async def pridruzi(ctx, *, naziv: str):
     uid = str(ctx.author.id)
+    naziv = naziv.upper().strip()
 
-    c.execute("SELECT * FROM timovi WHERE ime=?", (name,))
-    if c.fetchone():
-        return await ctx.send("❌ Team exists.")
+    if dohvati_tim_igraca(uid):
+        return await ctx.send(embed=greska_embed("Već si u timu. Izađi prvo s !izlaz"))
 
-    c.execute("INSERT INTO timovi VALUES (?,?)", (name, uid))
-    conn.commit()
-    await ctx.send(f"🏆 Team {name} created.")
+    c.execute("SELECT naziv FROM timovi WHERE naziv=?", (naziv,))
+    if not c.fetchone():
+        return await ctx.send(embed=greska_embed(f"Tim {naziv} ne postoji."))
 
-@bot.command()
-async def join(ctx, name):
-    uid = str(ctx.author.id)
-
-    if get_team(uid):
-        return await ctx.send("❌ Already in team.")
-
-    c.execute("SELECT clanovi FROM timovi WHERE ime=?", (name.upper(),))
-    t = c.fetchone()
-    if not t:
-        return await ctx.send("❌ Team not found.")
-
-    clanovi = t[0].split(",") if t[0] else []
-
+    clanovi = dohvati_clanove_tima(naziv)
     if len(clanovi) >= 5:
-        return await ctx.send("❌ Team full.")
+        return await ctx.send(embed=greska_embed("Tim je pun (max 5 igrača)."))
 
     clanovi.append(uid)
-
-    c.execute("UPDATE timovi SET clanovi=? WHERE ime=?",
-              (",".join(clanovi), name.upper()))
+    c.execute("UPDATE timovi SET clanovi=? WHERE naziv=?", (",".join(clanovi), naziv))
+    osiguraj_igraca(uid)
+    c.execute("UPDATE igraci SET tim=? WHERE id=?", (naziv, uid))
     conn.commit()
 
-    await ctx.send("✅ Joined team.")
+    embed = discord.Embed(title="◈ Pridružen Timu", color=0x2ecc71)
+    embed.add_field(name="Tim", value=f"**{naziv}**")
+    embed.add_field(name="Igrač", value=ctx.author.display_name)
+    embed.add_field(name="Mjesta", value=f"{len(clanovi)} / 5")
+    await ctx.send(embed=embed)
 
 @bot.command()
-async def leave(ctx):
+async def izlaz(ctx):
     uid = str(ctx.author.id)
+    naziv_tima = dohvati_tim_igraca(uid)
 
-    c.execute("SELECT ime, clanovi FROM timovi")
-    for ime, clanovi in c.fetchall():
-        if clanovi:
-            l = clanovi.split(",")
-            if uid in l:
-                l.remove(uid)
-                c.execute("UPDATE timovi SET clanovi=? WHERE ime=?",
-                          (",".join(l), ime))
-                conn.commit()
-                return await ctx.send("🚪 Left team.")
+    if not naziv_tima:
+        return await ctx.send(embed=greska_embed("Nisi u nijednom timu."))
 
-    await ctx.send("❌ Not in team.")
+    clanovi = dohvati_clanove_tima(naziv_tima)
+    clanovi = [m for m in clanovi if m != uid]
+    c.execute("UPDATE timovi SET clanovi=? WHERE naziv=?", (",".join(clanovi), naziv_tima))
+    c.execute("UPDATE igraci SET tim=NULL WHERE id=?", (uid,))
+    conn.commit()
 
-# =========================
-# STATS
-# =========================
+    embed = discord.Embed(title="◈ Napustio Tim", color=0xe67e22)
+    embed.add_field(name="Tim", value=naziv_tima)
+    embed.add_field(name="Igrač", value=ctx.author.display_name)
+    await ctx.send(embed=embed)
+
 @bot.command()
-async def stats(ctx, member: discord.Member = None):
+async def tim(ctx, *, naziv: str):
+    naziv = naziv.upper().strip()
+    c.execute("SELECT kreiran FROM timovi WHERE naziv=?", (naziv,))
+    red = c.fetchone()
+    if not red:
+        return await ctx.send(embed=greska_embed(f"Tim {naziv} ne postoji."))
+
+    clanovi = dohvati_clanove_tima(naziv)
+    embed = discord.Embed(title=f"◈ Tim  {naziv}", color=0x3498db)
+    embed.description = "─" * 32
+
+    if clanovi:
+        ukupni_acr = 0
+        lista = []
+        for uid in clanovi:
+            member = ctx.guild.get_member(int(uid))
+            ime = member.display_name if member else "Nepoznat"
+            p = dohvati_igraca(uid)
+            ukupni_acr += p["acr"]
+            lista.append(f"◦ **{ime}** — {rang_naziv(p['acr'])}  •  ACR: **{p['acr']}**")
+        embed.add_field(name="Sastav", value="\n".join(lista), inline=False)
+        embed.add_field(name="Prosječni ACR", value=str(ukupni_acr // len(clanovi)))
+        embed.add_field(name="Igrači", value=f"{len(clanovi)} / 5")
+    else:
+        embed.description = "Tim nema članova."
+
+    embed.set_footer(text=f"Osnovan: {red['kreiran']}")
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def timovi_lista(ctx):
+    c.execute("SELECT naziv, clanovi FROM timovi ORDER BY naziv")
+    svi = c.fetchall()
+
+    if not svi:
+        return await ctx.send(embed=greska_embed("Nema registriranih timova."))
+
+    embed = discord.Embed(title="◈ Registrirani Timovi", color=0x9b59b6)
+    embed.description = "─" * 32 + "\n"
+    for red in svi:
+        clanovi = [m for m in red["clanovi"].split(",") if m] if red["clanovi"] else []
+        embed.add_field(name=f"◦ {red['naziv']}", value=f"Igrači: **{len(clanovi)}/5**", inline=True)
+
+    await ctx.send(embed=embed)
+
+# ═══════════════════════════════════════════════
+#  STATISTIKE
+# ═══════════════════════════════════════════════
+@bot.command()
+async def statistike(ctx, member: discord.Member = None):
     member = member or ctx.author
     uid = str(member.id)
+    osiguraj_igraca(uid)
+    p = dohvati_igraca(uid)
 
-    ensure_player(uid)
+    ukupno = p["pobjede"] + p["porazi"]
+    winrate = round((p["pobjede"] / ukupno * 100), 1) if ukupno > 0 else 0
 
-    c.execute("SELECT acr,wins,losses,mvp,tournaments FROM igraci WHERE id=?", (uid,))
-    acr,w,l,m,t = c.fetchone()
-
-    embed = discord.Embed(title=f"📊 Stats {member.display_name}", color=0x3498db)
-    embed.add_field(name="ACR", value=acr)
-    embed.add_field(name="Wins", value=w)
-    embed.add_field(name="Losses", value=l)
-    embed.add_field(name="MVP", value=m)
-    embed.add_field(name="Tournaments", value=t)
-
+    embed = discord.Embed(color=rang_boja(p["acr"]))
+    embed.set_author(name=member.display_name, icon_url=member.display_avatar.url)
+    embed.title = rang_naziv(p["acr"])
+    embed.description = f"**Napredak do sljedećeg ranga**\n{rang_napredak(p['acr'])}"
+    embed.add_field(name="⚡ ACR", value=f"**{p['acr']}**")
+    embed.add_field(name="✦ Pobjede", value=f"**{p['pobjede']}**")
+    embed.add_field(name="✦ Porazi", value=f"**{p['porazi']}**")
+    embed.add_field(name="📊 Win Rate", value=f"**{winrate}%**")
+    embed.add_field(name="⭐ MVP", value=f"**{p['mvp']}**")
+    embed.add_field(name="🏆 Turniri", value=f"**{p['turniri']}**")
+    embed.add_field(name="👥 Tim", value=f"**{p['tim'] or 'Bez tima'}**")
+    embed.add_field(name="📅 Registriran", value=f"**{p['registriran'] or 'N/A'}**")
+    embed.set_thumbnail(url=member.display_avatar.url)
     await ctx.send(embed=embed)
 
-# =========================
-# LEADERBOARD (FIXED)
-# =========================
+# ═══════════════════════════════════════════════
+#  LJESTVICA
+# ═══════════════════════════════════════════════
 @bot.command()
-async def leaderboard(ctx):
-    c.execute("SELECT id, acr, tournaments FROM igraci ORDER BY acr DESC")
-    rows = c.fetchall()
+async def ljestvica(ctx):
+    redovi = c.execute(
+        "SELECT id, acr, pobjede, porazi, turniri, tim FROM igraci ORDER BY acr DESC LIMIT 10"
+    ).fetchall()
 
-    embed = discord.Embed(title="🏆 Leaderboard", color=0xf1c40f)
+    if not redovi:
+        return await ctx.send(embed=greska_embed("Još nema igrača na ljestvici."))
 
-    def rank(acr):
-        if acr < 900: return "Bronze"
-        if acr < 1100: return "Silver"
-        if acr < 1300: return "Gold"
-        if acr < 1500: return "Platinum"
-        return "Elite"
+    embed = discord.Embed(
+        title="◈ ACR Ljestvica",
+        description="─" * 32,
+        color=0xf1c40f
+    )
 
-    i = 1
-    for uid, acr, t in rows[:10]:
-        member = ctx.guild.get_member(int(uid))
-        name = member.display_name if member else "Unknown"
-
-        team = get_team(uid) or "No team"
+    oznake = ["🥇", "🥈", "🥉", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"]
+    for i, red in enumerate(redovi):
+        member = ctx.guild.get_member(int(red["id"]))
+        ime = member.display_name if member else "Nepoznat"
+        ukupno = red["pobjede"] + red["porazi"]
+        wr = round(red["pobjede"] / ukupno * 100) if ukupno > 0 else 0
 
         embed.add_field(
-            name=f"{i}. {name}",
-            value=f"{rank(acr)} | ACR {acr}\nTeam: {team}\n🏆 {t}",
+            name=f"{oznake[i]}  {ime}",
+            value=(
+                f"{rang_naziv(red['acr'])}  •  **{red['acr']}** ACR\n"
+                f"W/L: {red['pobjede']}/{red['porazi']} ({wr}%)  •  🏆 {red['turniri']}  •  👥 {red['tim'] or '—'}"
+            ),
             inline=False
         )
-        i += 1
+
+    embed.set_footer(text=f"Ažurirano: {datetime.utcnow().strftime('%d.%m.%Y %H:%M')} UTC")
+    await ctx.send(embed=embed)
+
+# ═══════════════════════════════════════════════
+#  MEČ SUSTAV (ADMIN)
+# ═══════════════════════════════════════════════
+@bot.command()
+async def start(ctx, tim_a: str, tim_b: str, mapa: str):
+    if not je_admin(ctx):
+        return await ctx.send(embed=greska_embed("Samo administratori mogu koristiti ovu komandu."))
+
+    tim_a = tim_a.upper()
+    tim_b = tim_b.upper()
+
+    embed = discord.Embed(title="◈ Meč Počinje", color=0xe67e22)
+    embed.description = "─" * 32
+    embed.add_field(name="⚔️  Dvoboj", value=f"**{tim_a}**  vs  **{tim_b}**", inline=False)
+    embed.add_field(name="🗺️  Mapa", value=f"**{mapa}**")
+    embed.add_field(name="🕐  Početak", value=datetime.utcnow().strftime("%d.%m.%Y %H:%M") + " UTC")
+    embed.set_footer(text="Neka pobijedi bolji tim.")
+    await objavi(ctx, embed)
+
+@bot.command()
+async def pobjeda(ctx, pobjednicki_tim: str, gubitnicki_tim: str, rezultat: str, mapa: str, mvp: discord.Member):
+    if not je_admin(ctx):
+        return await ctx.send(embed=greska_embed("Samo administratori mogu koristiti ovu komandu."))
+
+    pobjednicki_tim = pobjednicki_tim.upper()
+    gubitnicki_tim = gubitnicki_tim.upper()
+    mvp_uid = str(mvp.id)
+
+    for uid in dohvati_clanove_tima(pobjednicki_tim):
+        osiguraj_igraca(uid)
+        bonus = 40 if uid == mvp_uid else 25
+        c.execute("UPDATE igraci SET acr=acr+?, pobjede=pobjede+1 WHERE id=?", (bonus, uid))
+
+    for uid in dohvati_clanove_tima(gubitnicki_tim):
+        osiguraj_igraca(uid)
+        c.execute("UPDATE igraci SET acr=MAX(0, acr-20), porazi=porazi+1 WHERE id=?", (uid,))
+
+    osiguraj_igraca(mvp_uid)
+    c.execute("UPDATE igraci SET mvp=mvp+1, acr=acr+10 WHERE id=?", (mvp_uid,))
+
+    spremi_mec(pobjednicki_tim, gubitnicki_tim, mapa, rezultat, pobjednicki_tim, gubitnicki_tim, mvp_uid)
+    conn.commit()
+
+    embed = discord.Embed(title="◈ Rezultat Meča", color=0x2ecc71)
+    embed.description = "─" * 32
+    embed.add_field(name="🏅  Pobjednik", value=f"**{pobjednicki_tim}**")
+    embed.add_field(name="💀  Poraženi", value=f"**{gubitnicki_tim}**")
+    embed.add_field(name="📊  Rezultat", value=f"**{rezultat}**")
+    embed.add_field(name="🗺️  Mapa", value=f"**{mapa}**")
+    embed.add_field(name="⭐  MVP", value=f"**{mvp.display_name}**")
+    embed.add_field(
+        name="⚡  ACR Promjene",
+        value=f"**{pobjednicki_tim}** +25 (MVP +40+10)\n**{gubitnicki_tim}** −20",
+        inline=False
+    )
+    await objavi(ctx, embed)
+
+# ═══════════════════════════════════════════════
+#  ACR ADMIN KOMANDA
+# ═══════════════════════════════════════════════
+@bot.command()
+async def acr(ctx, member: discord.Member, k: int, d: int, a: int, adr: int, hs: int, util: int, flashevi: int):
+    if not je_admin(ctx):
+        return await ctx.send(embed=greska_embed("Samo administratori mogu koristiti ovu komandu."))
+
+    uid = str(member.id)
+    osiguraj_igraca(uid)
+
+    rezultat = round(
+        (k * 2.0) + (a * 1.5) + (adr * 0.3) +
+        (hs * 1.2) + (util * 0.5) + (flashevi * 0.2) - (d * 1.5)
+    )
+
+    stari_acr = dohvati_igraca(uid)["acr"]
+    c.execute("UPDATE igraci SET acr=MAX(0, acr+?) WHERE id=?", (rezultat, uid))
+    conn.commit()
+    novi_acr = dohvati_igraca(uid)["acr"]
+
+    predznak = "+" if rezultat >= 0 else ""
+    embed = discord.Embed(title="◈ ACR Ažuriran", color=rang_boja(novi_acr))
+    embed.add_field(name="Igrač", value=member.display_name)
+    embed.add_field(name="Promjena", value=f"**{predznak}{rezultat}**")
+    embed.add_field(name="ACR", value=f"{stari_acr} → **{novi_acr}**")
+    embed.add_field(name="Rang", value=rang_naziv(novi_acr))
+    embed.add_field(
+        name="Performanse",
+        value=f"K: {k}  D: {d}  A: {a}\nADR: {adr}  HS: {hs}%  Util: {util}  Flash: {flashevi}",
+        inline=False
+    )
+    await ctx.send(embed=embed)
+
+# ═══════════════════════════════════════════════
+#  TURNIRSKA POBJEDA (ADMIN)
+# ═══════════════════════════════════════════════
+@bot.command()
+async def turnir(ctx, naziv_tima: str):
+    if not je_admin(ctx):
+        return await ctx.send(embed=greska_embed("Samo administratori mogu koristiti ovu komandu."))
+
+    naziv_tima = naziv_tima.upper()
+    clanovi = dohvati_clanove_tima(naziv_tima)
+
+    if not clanovi:
+        return await ctx.send(embed=greska_embed(f"Tim {naziv_tima} ne postoji ili je prazan."))
+
+    for uid in clanovi:
+        osiguraj_igraca(uid)
+        c.execute("UPDATE igraci SET turniri=turniri+1, acr=acr+150 WHERE id=?", (uid,))
+    conn.commit()
+
+    embed = discord.Embed(title="◈ Turnirski Prvak", color=0xf39c12)
+    embed.description = f"Tim **{naziv_tima}** osvaja turnir!"
+    embed.add_field(name="🎁 Nagrada", value="+150 ACR za sve članove", inline=False)
+
+    imena = []
+    for uid in clanovi:
+        m = ctx.guild.get_member(int(uid))
+        imena.append(f"◦ {m.display_name if m else 'Nepoznat'}")
+    embed.add_field(name="👥 Sastav", value="\n".join(imena), inline=False)
+    embed.set_footer(text=datetime.utcnow().strftime("%d.%m.%Y %H:%M UTC"))
+    await objavi(ctx, embed)
+
+# ═══════════════════════════════════════════════
+#  ADMIN — DODAJ / UKLONI IGRAČA
+# ═══════════════════════════════════════════════
+@bot.command()
+async def dodaj(ctx, member: discord.Member, naziv_tima: str):
+    if not je_admin(ctx):
+        return await ctx.send(embed=greska_embed("Samo administratori mogu koristiti ovu komandu."))
+
+    uid = str(member.id)
+    naziv_tima = naziv_tima.upper()
+
+    if dohvati_tim_igraca(uid):
+        return await ctx.send(embed=greska_embed("Igrač je već u nekom timu."))
+
+    c.execute("SELECT naziv FROM timovi WHERE naziv=?", (naziv_tima,))
+    if not c.fetchone():
+        return await ctx.send(embed=greska_embed(f"Tim {naziv_tima} ne postoji."))
+
+    clanovi = dohvati_clanove_tima(naziv_tima)
+    if len(clanovi) >= 5:
+        return await ctx.send(embed=greska_embed("Tim je pun (max 5 igrača)."))
+
+    clanovi.append(uid)
+    c.execute("UPDATE timovi SET clanovi=? WHERE naziv=?", (",".join(clanovi), naziv_tima))
+    osiguraj_igraca(uid)
+    c.execute("UPDATE igraci SET tim=? WHERE id=?", (naziv_tima, uid))
+    conn.commit()
+
+    embed = uspjeh_embed("Igrač Dodan")
+    embed.add_field(name="Igrač", value=member.display_name)
+    embed.add_field(name="Tim", value=naziv_tima)
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def ukloni(ctx, member: discord.Member):
+    if not je_admin(ctx):
+        return await ctx.send(embed=greska_embed("Samo administratori mogu koristiti ovu komandu."))
+
+    uid = str(member.id)
+    naziv_tima = dohvati_tim_igraca(uid)
+
+    if not naziv_tima:
+        return await ctx.send(embed=greska_embed("Igrač nije ni u jednom timu."))
+
+    clanovi = dohvati_clanove_tima(naziv_tima)
+    clanovi = [m for m in clanovi if m != uid]
+    c.execute("UPDATE timovi SET clanovi=? WHERE naziv=?", (",".join(clanovi), naziv_tima))
+    c.execute("UPDATE igraci SET tim=NULL WHERE id=?", (uid,))
+    conn.commit()
+
+    embed = uspjeh_embed("Igrač Uklonjen")
+    embed.add_field(name="Igrač", value=member.display_name)
+    embed.add_field(name="Iz tima", value=naziv_tima)
+    await ctx.send(embed=embed)
+
+# ═══════════════════════════════════════════════
+#  POVIJEST MEČEVA
+# ═══════════════════════════════════════════════
+@bot.command()
+async def povijest(ctx):
+    redovi = c.execute("SELECT * FROM meczevi ORDER BY id DESC LIMIT 20").fetchall()
+
+    if not redovi:
+        return await ctx.send(embed=greska_embed("Još nema odigranih mečeva."))
+
+    embed = discord.Embed(
+        title="◈ Povijest Mečeva",
+        description="─" * 32,
+        color=0x9b59b6
+    )
+
+    for red in redovi:
+        mvp_member = ctx.guild.get_member(int(red["mvp_id"])) if red["mvp_id"] else None
+        mvp_ime = mvp_member.display_name if mvp_member else "Nepoznat"
+        embed.add_field(
+            name=f"#{red['id']}  {red['tim_a']} vs {red['tim_b']}",
+            value=(
+                f"🏅 **{red['pobjednik']}**  •  {red['rezultat']}\n"
+                f"🗺️ {red['mapa']}  •  ⭐ {mvp_ime}\n"
+                f"🕐 {red['odigrano']} UTC"
+            ),
+            inline=False
+        )
 
     await ctx.send(embed=embed)
 
-# =========================
-# ADMIN BASIC
-# =========================
+# ═══════════════════════════════════════════════
+#  RANG LISTA
+# ═══════════════════════════════════════════════
 @bot.command()
-async def admincommands(ctx):
-    if not is_admin(ctx):
-        return await ctx.send("❌ Admin only.")
+async def rangovi(ctx):
+    embed = discord.Embed(
+        title="◈ Rang Sustav",
+        description="─" * 32,
+        color=0xf1c40f
+    )
 
-    await ctx.send("!start !win !addplayer !removeplayer !tournamentwin")
+    for i, (min_acr, naziv, _) in enumerate(RANGOVI):
+        if i + 1 < len(RANGOVI):
+            raspon = f"{min_acr} – {RANGOVI[i + 1][0] - 1} ACR"
+        else:
+            raspon = f"{min_acr}+ ACR"
+        embed.add_field(name=naziv, value=raspon, inline=False)
+
+    await ctx.send(embed=embed)
+
+# ═══════════════════════════════════════════════
+#  IZAZOV
+# ═══════════════════════════════════════════════
+aktivni_izazovi = {}
 
 @bot.command()
-async def addplayer(ctx, member: discord.Member, team):
-    if not is_admin(ctx):
-        return await ctx.send("❌ Admin only.")
+async def izazovi(ctx, naziv_tima: str):
+    uid = str(ctx.author.id)
+    moj_tim = dohvati_tim_igraca(uid)
+    naziv_tima = naziv_tima.upper()
+
+    if not moj_tim:
+        return await ctx.send(embed=greska_embed("Nisi ni u jednom timu."))
+    if moj_tim == naziv_tima:
+        return await ctx.send(embed=greska_embed("Ne možeš izazvati vlastiti tim."))
+
+    c.execute("SELECT naziv FROM timovi WHERE naziv=?", (naziv_tima,))
+    if not c.fetchone():
+        return await ctx.send(embed=greska_embed(f"Tim {naziv_tima} ne postoji."))
+
+    aktivni_izazovi[naziv_tima] = moj_tim
+
+    embed = discord.Embed(title="◈ Izazov Poslan", color=0xe67e22)
+    embed.description = (
+        f"**{moj_tim}** izaziva **{naziv_tima}** na meč!\n\n"
+        f"Kapetan tima **{naziv_tima}** može prihvatiti s `!prihvati`"
+    )
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def prihvati(ctx):
+    uid = str(ctx.author.id)
+    moj_tim = dohvati_tim_igraca(uid)
+
+    if not moj_tim or moj_tim not in aktivni_izazovi:
+        return await ctx.send(embed=greska_embed("Nemaš aktivnih izazova."))
+
+    izazivac = aktivni_izazovi.pop(moj_tim)
+
+    embed = discord.Embed(title="◈ Izazov Prihvaćen!", color=0x2ecc71)
+    embed.description = (
+        f"**{izazivac}** vs **{moj_tim}**\n\n"
+        f"Meč je dogovoren! Admin treba pokrenuti s:\n"
+        f"`!start {izazivac} {moj_tim} <mapa>`"
+    )
+    await ctx.send(embed=embed)
+
+# ═══════════════════════════════════════════════
+#  KAZNA / DISCIPLINA (ADMIN)
+# ═══════════════════════════════════════════════
+@bot.command()
+async def kazna(ctx, member: discord.Member, iznos: int, *, razlog: str):
+    if not je_admin(ctx):
+        return await ctx.send(embed=greska_embed("Samo administratori mogu koristiti ovu komandu."))
 
     uid = str(member.id)
+    osiguraj_igraca(uid)
 
-    c.execute("SELECT clanovi FROM timovi WHERE ime=?", (team.upper(),))
-    t = c.fetchone()
-    if not t:
-        return await ctx.send("❌ Team not found.")
-
-    l = t[0].split(",") if t[0] else []
-
-    if uid in l:
-        return await ctx.send("❌ Already in team.")
-
-    l.append(uid)
-
-    c.execute("UPDATE timovi SET clanovi=? WHERE ime=?",
-              (",".join(l), team.upper()))
+    c.execute("UPDATE igraci SET acr=MAX(0, acr-?) WHERE id=?", (iznos, uid))
+    c.execute(
+        "INSERT INTO kazne (igrac_id, razlog, kazna, admin_id, datum) VALUES (?,?,?,?,?)",
+        (uid, razlog, iznos, str(ctx.author.id), datetime.utcnow().strftime("%d.%m.%Y %H:%M"))
+    )
     conn.commit()
 
-    await ctx.send("✅ Added.")
+    novi_acr = dohvati_igraca(uid)["acr"]
+    embed = discord.Embed(title="◈ Disciplinska Mjera", color=0xe74c3c)
+    embed.add_field(name="Igrač", value=member.display_name)
+    embed.add_field(name="Kazna", value=f"−{iznos} ACR")
+    embed.add_field(name="Novi ACR", value=str(novi_acr))
+    embed.add_field(name="Razlog", value=razlog, inline=False)
+    embed.add_field(name="Admin", value=ctx.author.display_name)
+    await ctx.send(embed=embed)
 
 @bot.command()
-async def removeplayer(ctx, member: discord.Member):
-    if not is_admin(ctx):
-        return await ctx.send("❌ Admin only.")
+async def kazne_povijest(ctx, member: discord.Member = None):
+    if member:
+        uid = str(member.id)
+        redovi = c.execute(
+            "SELECT * FROM kazne WHERE igrac_id=? ORDER BY id DESC LIMIT 10", (uid,)
+        ).fetchall()
+        naslov = f"◈ Kazne — {member.display_name}"
+    else:
+        redovi = c.execute("SELECT * FROM kazne ORDER BY id DESC LIMIT 10").fetchall()
+        naslov = "◈ Posljednjih 10 Kazni"
+
+    if not redovi:
+        return await ctx.send(embed=greska_embed("Nema zabilježenih kazni."))
+
+    embed = discord.Embed(title=naslov, color=0xe74c3c)
+    for red in redovi:
+        igrac = ctx.guild.get_member(int(red["igrac_id"]))
+        ime = igrac.display_name if igrac else "Nepoznat"
+        embed.add_field(
+            name=f"#{red['id']}  {ime}  −{red['kazna']} ACR",
+            value=f"Razlog: {red['razlog']}\n🕐 {red['datum']}",
+            inline=False
+        )
+    await ctx.send(embed=embed)
+
+# ═══════════════════════════════════════════════
+#  RESET IGRAČA (ADMIN)
+# ═══════════════════════════════════════════════
+@bot.command()
+async def reset_igraca(ctx, member: discord.Member):
+    if not je_admin(ctx):
+        return await ctx.send(embed=greska_embed("Samo administratori mogu koristiti ovu komandu."))
 
     uid = str(member.id)
-
-    c.execute("SELECT ime, clanovi FROM timovi")
-    for ime, clanovi in c.fetchall():
-        if clanovi and uid in clanovi.split(","):
-            l = clanovi.split(",")
-            l.remove(uid)
-
-            c.execute("UPDATE timovi SET clanovi=? WHERE ime=?",
-                      (",".join(l), ime))
-            conn.commit()
-
-            return await ctx.send("🚪 Removed.")
-
-# =========================
-# TOURNAMENT
-# =========================
-@bot.command()
-async def tournamentwin(ctx, user_id):
-    if not is_admin(ctx):
-        return await ctx.send("❌ Admin only.")
-
-    ensure_player(str(user_id))
-
-    c.execute("UPDATE igraci SET tournaments=tournaments+1 WHERE id=?", (str(user_id),))
+    c.execute(
+        "UPDATE igraci SET acr=1000, pobjede=0, porazi=0, mvp=0, turniri=0 WHERE id=?",
+        (uid,)
+    )
     conn.commit()
 
-    await ctx.send("🏆 Tournament added.")
+    embed = uspjeh_embed("Statistike Resetirane")
+    embed.add_field(name="Igrač", value=member.display_name)
+    embed.add_field(name="ACR reset na", value="1000")
+    await ctx.send(embed=embed)
 
-# =========================
-# RUN
-# =========================
+# ═══════════════════════════════════════════════
+#  SERVER STATISTIKE
+# ═══════════════════════════════════════════════
+@bot.command()
+async def server(ctx):
+    ukupno_igrac = c.execute("SELECT COUNT(*) FROM igraci").fetchone()[0]
+    ukupno_tim = c.execute("SELECT COUNT(*) FROM timovi").fetchone()[0]
+    ukupno_mec = c.execute("SELECT COUNT(*) FROM meczevi").fetchone()[0]
+
+    top = c.execute("SELECT id, acr FROM igraci ORDER BY acr DESC LIMIT 1").fetchone()
+    top_ime = "N/A"
+    if top:
+        m = ctx.guild.get_member(int(top["id"]))
+        top_ime = f"{m.display_name if m else 'Nepoznat'} ({top['acr']} ACR)"
+
+    embed = discord.Embed(title=f"◈ {ctx.guild.name}  —  Server Info", color=0x3498db)
+    if ctx.guild.icon:
+        embed.set_thumbnail(url=ctx.guild.icon.url)
+    embed.add_field(name="👥 Registrirani igrači", value=str(ukupno_igrac))
+    embed.add_field(name="🎮 Aktivni timovi", value=str(ukupno_tim))
+    embed.add_field(name="⚔️ Odigrani mečevi", value=str(ukupno_mec))
+    embed.add_field(name="🏆 Vodeći igrač", value=top_ime, inline=False)
+    embed.set_footer(text=f"Discord: {ctx.guild.member_count} članova")
+    await ctx.send(embed=embed)
+
+# ═══════════════════════════════════════════════
+#  USPOREDBA IGRAČA
+# ═══════════════════════════════════════════════
+@bot.command()
+async def usporedi(ctx, igrac1: discord.Member, igrac2: discord.Member):
+    uid1, uid2 = str(igrac1.id), str(igrac2.id)
+    osiguraj_igraca(uid1)
+    osiguraj_igraca(uid2)
+    p1, p2 = dohvati_igraca(uid1), dohvati_igraca(uid2)
+
+    def wr(p):
+        uk = p["pobjede"] + p["porazi"]
+        return round(p["pobjede"] / uk * 100, 1) if uk > 0 else 0
+
+    def znak(a, b):
+        return "✦" if a > b else "◦"
+
+    embed = discord.Embed(title=f"◈ {igrac1.display_name}  vs  {igrac2.display_name}", color=0xf1c40f)
+    embed.add_field(
+        name=igrac1.display_name,
+        value=(
+            f"ACR: **{p1['acr']}** {znak(p1['acr'], p2['acr'])}\n"
+            f"W/L: {p1['pobjede']}/{p1['porazi']}\n"
+            f"WR: {wr(p1)}% {znak(wr(p1), wr(p2))}\n"
+            f"MVP: {p1['mvp']} {znak(p1['mvp'], p2['mvp'])}\n"
+            f"Turniri: {p1['turniri']} {znak(p1['turniri'], p2['turniri'])}\n"
+            f"Rang: {rang_naziv(p1['acr'])}"
+        )
+    )
+    embed.add_field(
+        name=igrac2.display_name,
+        value=(
+            f"ACR: **{p2['acr']}** {znak(p2['acr'], p1['acr'])}\n"
+            f"W/L: {p2['pobjede']}/{p2['porazi']}\n"
+            f"WR: {wr(p2)}% {znak(wr(p2), wr(p1))}\n"
+            f"MVP: {p2['mvp']} {znak(p2['mvp'], p1['mvp'])}\n"
+            f"Turniri: {p2['turniri']} {znak(p2['turniri'], p1['turniri'])}\n"
+            f"Rang: {rang_naziv(p2['acr'])}"
+        )
+    )
+    pobjednik = igrac1.display_name if p1["acr"] >= p2["acr"] else igrac2.display_name
+    embed.set_footer(text=f"✦ označava prednost  •  Viši ACR: {pobjednik}")
+    await ctx.send(embed=embed)
+
+# ═══════════════════════════════════════════════
+#  SLUČAJNA MAPA / VETO
+# ═══════════════════════════════════════════════
+CS2_MAPE = [
+    "Mirage", "Inferno", "Dust2", "Nuke", "Ancient",
+    "Vertigo", "Anubis", "Cache", "Overpass", "Train"
+]
+
+@bot.command()
+async def mapa(ctx):
+    odabrana = random.choice(CS2_MAPE)
+    embed = discord.Embed(
+        title="◈ Odabrana Mapa",
+        description=f"# {odabrana}",
+        color=0xe67e22
+    )
+    embed.set_footer(text="Nasumično odabrano  •  CS2 Kompetitivni Pool")
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def veto(ctx, tim_a: str, tim_b: str):
+    mape = CS2_MAPE.copy()
+    random.shuffle(mape)
+
+    embed = discord.Embed(title="◈ Mapa Veto", color=0x9b59b6)
+    embed.description = f"**{tim_a.upper()}** vs **{tim_b.upper()}**\n─────────────────────\n"
+    for i, m in enumerate(mape, 1):
+        embed.description += f"`{i}.` **{m}**\n"
+    embed.set_footer(text="Timovi izmjenično banuju mape")
+    await ctx.send(embed=embed)
+
+# ═══════════════════════════════════════════════
+#  KOMANDE (HELP)
+# ═══════════════════════════════════════════════
+@bot.command()
+async def commands(ctx):
+    embed = discord.Embed(
+        title="◈ Popis Komandi",
+        description="─" * 32,
+        color=0x3498db
+    )
+
+    embed.add_field(name="👥  Timovi", value=(
+        "`!stvori <naziv>` — Stvori tim\n"
+        "`!pridruzi <naziv>` — Pridruži se timu\n"
+        "`!izlaz` — Napusti tim\n"
+        "`!tim <naziv>` — Info o timu\n"
+        "`!timovi_lista` — Svi timovi\n"
+        "`!izazovi <naziv_tima>` — Izazovi tim na meč\n"
+        "`!prihvati` — Prihvati izazov"
+    ), inline=False)
+
+    embed.add_field(name="📊  Statistike", value=(
+        "`!statistike [@korisnik]` — Prikaz statistika\n"
+        "`!ljestvica` — Top 10 igrača po ACR-u\n"
+        "`!povijest` — Zadnjih 20 mečeva\n"
+        "`!usporedi @igrac1 @igrac2` — Usporedi dva igrača\n"
+        "`!rangovi` — Prikaz rang sustava\n"
+        "`!server` — Statistike servera"
+    ), inline=False)
+
+    embed.add_field(name="🎮  Mapa", value=(
+        "`!mapa` — Nasumična CS2 mapa\n"
+        "`!veto <timA> <timB>` — Prikaz veto liste mapa"
+    ), inline=False)
+
+    embed.add_field(name="🔐  Admin", value=(
+        "`!adminkomande` — Prikaz admin komandi"
+    ), inline=False)
+
+    embed.set_footer(text="◈ CS2 Esports Bot  •  !adminkomande za admin opcije")
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def adminkomande(ctx):
+    if not je_admin(ctx):
+        return await ctx.send(embed=greska_embed("Samo administratori mogu vidjeti ove komande."))
+
+    embed = discord.Embed(
+        title="◈ Admin Komande",
+        description="─" * 32,
+        color=0xe74c3c
+    )
+
+    embed.add_field(name="⚔️  Meč", value=(
+        "`!start <timA> <timB> <mapa>` — Početak meča\n"
+        "`!pobjeda <pobjednik> <gubitnik> <rezultat> <mapa> @mvp` — Unos rezultata"
+    ), inline=False)
+
+    embed.add_field(name="⚡  ACR", value=(
+        "`!acr @korisnik <k> <d> <a> <adr> <hs> <util> <flash>` — Ručna korekcija ACR-a"
+    ), inline=False)
+
+    embed.add_field(name="👥  Igrači", value=(
+        "`!dodaj @korisnik <tim>` — Dodaj igrača u tim\n"
+        "`!ukloni @korisnik` — Ukloni igrača iz tima\n"
+        "`!reset_igraca @korisnik` — Reset statistika igrača"
+    ), inline=False)
+
+    embed.add_field(name="🏆  Turnir", value=(
+        "`!turnir <naziv_tima>` — Dodijeli turnirsku pobjedu (+150 ACR)"
+    ), inline=False)
+
+    embed.add_field(name="⚖️  Disciplina", value=(
+        "`!kazna @korisnik <iznos> <razlog>` — Oduzmi ACR kao kaznu\n"
+        "`!kazne_povijest [@korisnik]` — Pregled svih kazni"
+    ), inline=False)
+
+    await ctx.send(embed=embed)
+
+# ═══════════════════════════════════════════════
+#  POKRETANJE
+# ═══════════════════════════════════════════════
 token = os.getenv("TOKEN")
-
-if token:
-    bot.run(token)
+if not token:
+    print("❌ TOKEN nije pronađen u environment varijablama!")
 else:
-    print("NO TOKEN")
+    bot.run(token)
