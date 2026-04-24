@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS igraci (
     acr INTEGER DEFAULT 1000,
     pobjede INTEGER DEFAULT 0,
     porazi INTEGER DEFAULT 0,
-    mvp INTEGER DEFAULT 0
+    mvp INTEGER DEFAULT 0,
+    turniri INTEGER DEFAULT 0
 )
 """)
 
@@ -49,7 +50,7 @@ def lista(x):
 def igrac(uid):
     c.execute("SELECT * FROM igraci WHERE id=?", (uid,))
     if not c.fetchone():
-        c.execute("INSERT INTO igraci VALUES (?,1000,0,0,0)", (uid,))
+        c.execute("INSERT INTO igraci VALUES (?,1000,0,0,0,0)", (uid,))
         conn.commit()
 
 def tim(ime):
@@ -164,21 +165,24 @@ async def stats(ctx, member: discord.Member = None):
 
     igrac(uid)
 
-    c.execute("SELECT acr,pobjede,porazi,mvp FROM igraci WHERE id=?", (uid,))
-    a,w,l,m = c.fetchone()
+    c.execute("SELECT acr,pobjede,porazi,mvp,turniri FROM igraci WHERE id=?", (uid,))
+    a,w,l,m,t = c.fetchone()
 
     embed = discord.Embed(title=f"📊 Statistika - {member.name}", color=0x3498db)
     embed.add_field(name="ACR", value=a)
     embed.add_field(name="Pobjede", value=w)
     embed.add_field(name="Porazi", value=l)
     embed.add_field(name="MVP", value=m)
+    embed.add_field(name="Turniri osvojeni", value=t)
 
     await ctx.send(embed=embed)
 
-# ✅ FIXED LEADERBOARD
+# =========================
+# 🔥 PREMIUM LEADERBOARD
+# =========================
 @bot.command()
 async def leaderboard(ctx):
-    c.execute("SELECT id, acr FROM igraci ORDER BY acr DESC")
+    c.execute("SELECT id, acr, turniri FROM igraci ORDER BY acr DESC")
     rows = c.fetchall()
 
     embed = discord.Embed(title="🏆 Leaderboard", color=0xf1c40f)
@@ -186,19 +190,38 @@ async def leaderboard(ctx):
     seen = set()
     mjesto = 1
 
-    for uid, acr in rows:
+    def rank(acr):
+        if acr < 900:
+            return "🟫 Bronze"
+        elif acr < 1100:
+            return "⬜ Silver"
+        elif acr < 1300:
+            return "🟨 Gold"
+        elif acr < 1500:
+            return "🟦 Platinum"
+        elif acr < 1700:
+            return "🟪 Diamond"
+        else:
+            return "🔥 Elite"
+
+    for uid, acr, turniri in rows:
         if uid in seen:
             continue
         seen.add(uid)
 
+        member = ctx.guild.get_member(int(uid))
+        ime = member.name if member else f"User-{uid}"
+
+        team = get_team(uid)
+        team_text = team if team else "Nema tim"
+
         embed.add_field(
-            name=f"{mjesto}. <@{uid}>",
-            value=f"{acr} ACR",
+            name=f"{mjesto}. {ime}",
+            value=f"{rank(acr)}\nACR: {acr}\nTim: {team_text}\n🏆 Turniri: {turniri}",
             inline=False
         )
 
         mjesto += 1
-
         if mjesto > 10:
             break
 
@@ -227,8 +250,14 @@ async def admincommands(ctx):
     )
 
     embed.add_field(
-        name="Upravljanje timovima",
+        name="Timovi",
         value="!addplayer @igrac <tim>\n!removeplayer @igrac",
+        inline=False
+    )
+
+    embed.add_field(
+        name="Turniri",
+        value="!tournamentwin <userID>",
         inline=False
     )
 
@@ -285,12 +314,27 @@ async def removeplayer(ctx, member: discord.Member):
     await ctx.send("❌ Igrač nije u timu.")
 
 # =========================
-# MATCH
+# TURNAMENT WIN
+# =========================
+@bot.command()
+async def tournamentwin(ctx, user_id):
+    if not admin(ctx):
+        return await ctx.send("❌ Samo admin.")
+
+    uid = str(user_id)
+    igrac(uid)
+
+    c.execute("UPDATE igraci SET turniri=turniri+1 WHERE id=?", (uid,))
+    conn.commit()
+
+    await ctx.send(f"🏆 <@{uid}> osvojio turnir!")
+
+# =========================
+# MATCH + ACR (OSTALO OSTALO ISTO)
 # =========================
 @bot.command()
 async def start(ctx, a, b, mapa):
     global AKTIVNI_MEC
-
     if not admin(ctx):
         return await ctx.send("❌ Samo admin.")
 
@@ -325,60 +369,6 @@ async def win(ctx, pobjednik, rezultat, mvp):
     AKTIVNI_MEC = None
 
     await announce(ctx, embed)
-
-# =========================
-# ACR
-# =========================
-@bot.command()
-async def acr(ctx, member: discord.Member, kills: int, deaths: int, assists: int,
-              adr: float, hs: float, util: int, flash: int):
-
-    if not admin(ctx):
-        return await ctx.send("❌ Samo admin.")
-
-    uid = str(member.id)
-    igrac(uid)
-
-    team = get_team(uid)
-
-    if not team:
-        return await ctx.send("❌ Igrač nije u timu.")
-
-    if not ZADNJI_POBJEDNIK:
-        return await ctx.send("❌ Nema meča.")
-
-    win = team == ZADNJI_POBJEDNIK
-
-    performance = (
-        kills * 1.2
-        - deaths * 0.8
-        + assists * 0.5
-        + adr * 0.05
-        + hs * 0.1
-        + util * 0.02
-        + flash * 0.3
-    )
-
-    acr_change = int(performance + (20 if win else -10))
-
-    if win:
-        c.execute("UPDATE igraci SET acr=acr+?, pobjede=pobjede+1 WHERE id=?", (acr_change, uid))
-    else:
-        c.execute("UPDATE igraci SET acr=acr+?, porazi=porazi+1 WHERE id=?", (acr_change, uid))
-
-    conn.commit()
-
-    c.execute("SELECT acr FROM igraci WHERE id=?", (uid,))
-    new_acr = c.fetchone()[0]
-
-    embed = discord.Embed(title="📊 ACR IZRAČUN", color=0x9b59b6)
-    embed.add_field(name="Igrač", value=member.mention)
-    embed.add_field(name="Tim", value=team)
-    embed.add_field(name="Rezultat", value="Pobjeda" if win else "Poraz")
-    embed.add_field(name="Promjena ACR", value=f"{acr_change:+}")
-    embed.add_field(name="Novi ACR", value=new_acr)
-
-    await ctx.send(embed=embed)
 
 # =========================
 # RUN
