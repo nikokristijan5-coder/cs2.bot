@@ -14,7 +14,28 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-KANAL_OBJAVE = "announcements"
+# ═══════════════════════════════════════════════
+#  KANALI
+# ═══════════════════════════════════════════════
+KANAL_OBJAVE      = "announcements"   # turniri, start meca, opce objave
+KANAL_REZULTATI   = "rezultati"       # rezultati meceva
+KANAL_DOBRODOSLICA = "general"        # dolazak novih clanova
+
+# ═══════════════════════════════════════════════
+#  RANG → ULOGA MAPIRANJE
+# ═══════════════════════════════════════════════
+# Naziv uloge mora tocno odgovarati nazivu uloge na Discordu
+RANG_ULOGE = {
+    "◈ Legendarni":   2500,
+    "◈ Elitni":       2000,
+    "◈ Majstorski":   1800,
+    "◈ Dijamantni":   1600,
+    "◈ Platinasti":   1400,
+    "◈ Zlatni":       1200,
+    "◈ Srebrni":      1050,
+    "◈ Brončani":      900,
+    "◈ Željezni":        0,
+}
 
 # ═══════════════════════════════════════════════
 #  BAZA PODATAKA
@@ -105,7 +126,48 @@ def rang_napredak(acr: int) -> str:
     return "`██████████` MAX RANG"
 
 # ═══════════════════════════════════════════════
-#  POMOĆNE FUNKCIJE
+#  AUTO ULOGA — CORE FUNKCIJA
+# ═══════════════════════════════════════════════
+async def azuriraj_ulogu(guild: discord.Guild, member: discord.Member, acr: int):
+    """Ukloni sve stare rang uloge i dodaj novu prema ACR-u."""
+    naziv_nove_uloge = rang_naziv(acr)
+
+    # Dohvati sve rang uloge koje postoje na serveru
+    sve_rang_uloge = []
+    for naziv_uloge in RANG_ULOGE:
+        uloga = discord.utils.get(guild.roles, name=naziv_uloge)
+        if uloga:
+            sve_rang_uloge.append(uloga)
+
+    # Ukloni sve stare rang uloge
+    uloge_za_ukloniti = [u for u in member.roles if u in sve_rang_uloge]
+    if uloge_za_ukloniti:
+        try:
+            await member.remove_roles(*uloge_za_ukloniti)
+        except discord.Forbidden:
+            pass
+
+    # Dodaj novu rang ulogu
+    nova_uloga = discord.utils.get(guild.roles, name=naziv_nove_uloge)
+    if nova_uloga:
+        try:
+            await member.add_roles(nova_uloga)
+        except discord.Forbidden:
+            pass
+
+async def azuriraj_ulogu_po_id(guild: discord.Guild, uid: str, acr: int):
+    """Pomocna funkcija — dohvaca member po ID-u pa azurira ulogu."""
+    try:
+        member = guild.get_member(int(uid))
+        if not member:
+            member = await guild.fetch_member(int(uid))
+        if member:
+            await azuriraj_ulogu(guild, member, acr)
+    except (discord.NotFound, discord.HTTPException):
+        pass
+
+# ═══════════════════════════════════════════════
+#  POMOCNE FUNKCIJE
 # ═══════════════════════════════════════════════
 def osiguraj_igraca(uid: str):
     c.execute("SELECT id FROM igraci WHERE id=?", (uid,))
@@ -139,6 +201,13 @@ def je_admin(ctx) -> bool:
 
 async def objavi(ctx, embed: discord.Embed):
     kanal = discord.utils.get(ctx.guild.text_channels, name=KANAL_OBJAVE)
+    if kanal:
+        await kanal.send(embed=embed)
+    else:
+        await ctx.send(embed=embed)
+
+async def objavi_rezultat(ctx, embed: discord.Embed):
+    kanal = discord.utils.get(ctx.guild.text_channels, name=KANAL_REZULTATI)
     if kanal:
         await kanal.send(embed=embed)
     else:
@@ -190,18 +259,28 @@ async def on_command_error(ctx, error):
         pass
 
 @bot.event
-async def on_member_join(member):
+async def on_member_join(member: discord.Member):
     uid = str(member.id)
     osiguraj_igraca(uid)
-    kanal = discord.utils.get(member.guild.text_channels, name=KANAL_OBJAVE)
+
+    # Dodijeli pocetnu rang ulogu (Zeljezni, 1000 ACR)
+    await azuriraj_ulogu(member.guild, member, 1000)
+
+    kanal = discord.utils.get(member.guild.text_channels, name=KANAL_DOBRODOSLICA)
     if kanal:
         embed = discord.Embed(
             title="◈ Novi Igrač",
-            description=f"**{member.display_name}** se pridružio serveru.\nDobrodošao u arenu.",
+            description=(
+                f"**{member.display_name}** se pridružio serveru.\n"
+                f"Dobrodošao u arenu.\n\n"
+                f"Pročitaj **#pravila** i **#bot-komande** za početak."
+            ),
             color=0x3498db
         )
         embed.set_thumbnail(url=member.display_avatar.url)
-        embed.set_footer(text=f"ACR: 1000  •  {rang_naziv(1000)}")
+        embed.add_field(name="⚡ Početni ACR", value="1000")
+        embed.add_field(name="🎖️ Rang", value=rang_naziv(1000))
+        embed.set_footer(text=f"Član #{member.guild.member_count}")
         await kanal.send(embed=embed)
 
 # ═══════════════════════════════════════════════
@@ -420,20 +499,31 @@ async def pobjeda(ctx, pobjednicki_tim: str, gubitnicki_tim: str, rezultat: str,
     gubitnicki_tim = gubitnicki_tim.upper()
     mvp_uid = str(mvp.id)
 
+    # Pobjednicki tim — azuriraj ACR i uloge
     for uid in dohvati_clanove_tima(pobjednicki_tim):
         osiguraj_igraca(uid)
         bonus = 40 if uid == mvp_uid else 25
         c.execute("UPDATE igraci SET acr=acr+?, pobjede=pobjede+1 WHERE id=?", (bonus, uid))
+        conn.commit()
+        novi_acr = dohvati_igraca(uid)["acr"]
+        await azuriraj_ulogu_po_id(ctx.guild, uid, novi_acr)
 
+    # Gubitnicki tim — azuriraj ACR i uloge
     for uid in dohvati_clanove_tima(gubitnicki_tim):
         osiguraj_igraca(uid)
         c.execute("UPDATE igraci SET acr=MAX(0, acr-20), porazi=porazi+1 WHERE id=?", (uid,))
+        conn.commit()
+        novi_acr = dohvati_igraca(uid)["acr"]
+        await azuriraj_ulogu_po_id(ctx.guild, uid, novi_acr)
 
+    # MVP bonus
     osiguraj_igraca(mvp_uid)
     c.execute("UPDATE igraci SET mvp=mvp+1, acr=acr+10 WHERE id=?", (mvp_uid,))
+    conn.commit()
+    novi_acr_mvp = dohvati_igraca(mvp_uid)["acr"]
+    await azuriraj_ulogu_po_id(ctx.guild, mvp_uid, novi_acr_mvp)
 
     spremi_mec(pobjednicki_tim, gubitnicki_tim, mapa, rezultat, pobjednicki_tim, gubitnicki_tim, mvp_uid)
-    conn.commit()
 
     embed = discord.Embed(title="◈ Rezultat Meča", color=0x2ecc71)
     embed.description = "─" * 32
@@ -447,7 +537,7 @@ async def pobjeda(ctx, pobjednicki_tim: str, gubitnicki_tim: str, rezultat: str,
         value=f"**{pobjednicki_tim}** +25 (MVP +40+10)\n**{gubitnicki_tim}** −20",
         inline=False
     )
-    await objavi(ctx, embed)
+    await objavi_rezultat(ctx, embed)
 
 # ═══════════════════════════════════════════════
 #  ACR ADMIN KOMANDA
@@ -470,12 +560,27 @@ async def acr(ctx, member: discord.Member, k: int, d: int, a: int, adr: int, hs:
     conn.commit()
     novi_acr = dohvati_igraca(uid)["acr"]
 
+    # Azuriraj ulogu
+    await azuriraj_ulogu(ctx.guild, member, novi_acr)
+
+    stari_rang = rang_naziv(stari_acr)
+    novi_rang = rang_naziv(novi_acr)
     predznak = "+" if rezultat >= 0 else ""
+
     embed = discord.Embed(title="◈ ACR Ažuriran", color=rang_boja(novi_acr))
     embed.add_field(name="Igrač", value=member.display_name)
     embed.add_field(name="Promjena", value=f"**{predznak}{rezultat}**")
     embed.add_field(name="ACR", value=f"{stari_acr} → **{novi_acr}**")
-    embed.add_field(name="Rang", value=rang_naziv(novi_acr))
+
+    # Pokazi rank up/down ako se rang promijenio
+    if stari_rang != novi_rang:
+        if novi_acr > stari_acr:
+            embed.add_field(name="🎉 RANK UP!", value=f"{stari_rang} → **{novi_rang}**", inline=False)
+        else:
+            embed.add_field(name="📉 Rang pao", value=f"{stari_rang} → **{novi_rang}**", inline=False)
+    else:
+        embed.add_field(name="Rang", value=novi_rang)
+
     embed.add_field(
         name="Performanse",
         value=f"K: {k}  D: {d}  A: {a}\nADR: {adr}  HS: {hs}%  Util: {util}  Flash: {flashevi}",
@@ -500,7 +605,9 @@ async def turnir(ctx, naziv_tima: str):
     for uid in clanovi:
         osiguraj_igraca(uid)
         c.execute("UPDATE igraci SET turniri=turniri+1, acr=acr+150 WHERE id=?", (uid,))
-    conn.commit()
+        conn.commit()
+        novi_acr = dohvati_igraca(uid)["acr"]
+        await azuriraj_ulogu_po_id(ctx.guild, uid, novi_acr)
 
     embed = discord.Embed(title="◈ Turnirski Prvak", color=0xf39c12)
     embed.description = f"Tim **{naziv_tima}** osvaja turnir!"
@@ -621,6 +728,37 @@ async def rangovi(ctx):
     await ctx.send(embed=embed)
 
 # ═══════════════════════════════════════════════
+#  SYNC ULOGA (ADMIN) — za postojece igrače
+# ═══════════════════════════════════════════════
+@bot.command()
+async def sync_uloge(ctx):
+    """Sinkronizira rang uloge za sve igrače u bazi — korisno za prvi setup."""
+    if not je_admin(ctx):
+        return await ctx.send(embed=greska_embed("Samo administratori mogu koristiti ovu komandu."))
+
+    msg = await ctx.send(embed=discord.Embed(
+        description="⏳ Sinkronizacija rang uloga u tijeku...",
+        color=0xe67e22
+    ))
+
+    svi = c.execute("SELECT id, acr FROM igraci").fetchall()
+    uspjeh = 0
+    greska = 0
+
+    for red in svi:
+        try:
+            await azuriraj_ulogu_po_id(ctx.guild, red["id"], red["acr"])
+            uspjeh += 1
+        except Exception:
+            greska += 1
+
+    embed = discord.Embed(title="◈ Sync Završen", color=0x2ecc71)
+    embed.add_field(name="✅ Ažurirano", value=str(uspjeh))
+    embed.add_field(name="❌ Greška", value=str(greska))
+    embed.add_field(name="📊 Ukupno", value=str(len(svi)))
+    await msg.edit(embed=embed)
+
+# ═══════════════════════════════════════════════
 #  IZAZOV
 # ═══════════════════════════════════════════════
 aktivni_izazovi = {}
@@ -678,6 +816,7 @@ async def kazna(ctx, member: discord.Member, iznos: int, *, razlog: str):
     uid = str(member.id)
     osiguraj_igraca(uid)
 
+    stari_acr = dohvati_igraca(uid)["acr"]
     c.execute("UPDATE igraci SET acr=MAX(0, acr-?) WHERE id=?", (iznos, uid))
     c.execute(
         "INSERT INTO kazne (igrac_id, razlog, kazna, admin_id, datum) VALUES (?,?,?,?,?)",
@@ -686,10 +825,13 @@ async def kazna(ctx, member: discord.Member, iznos: int, *, razlog: str):
     conn.commit()
 
     novi_acr = dohvati_igraca(uid)["acr"]
+    await azuriraj_ulogu(ctx.guild, member, novi_acr)
+
     embed = discord.Embed(title="◈ Disciplinska Mjera", color=0xe74c3c)
     embed.add_field(name="Igrač", value=member.display_name)
     embed.add_field(name="Kazna", value=f"−{iznos} ACR")
-    embed.add_field(name="Novi ACR", value=str(novi_acr))
+    embed.add_field(name="ACR", value=f"{stari_acr} → **{novi_acr}**")
+    embed.add_field(name="Rang", value=rang_naziv(novi_acr))
     embed.add_field(name="Razlog", value=razlog, inline=False)
     embed.add_field(name="Admin", value=ctx.author.display_name)
     await ctx.send(embed=embed)
@@ -735,9 +877,13 @@ async def reset_igraca(ctx, member: discord.Member):
     )
     conn.commit()
 
+    # Reset uloge na Zeljezni (1000 ACR)
+    await azuriraj_ulogu(ctx.guild, member, 1000)
+
     embed = uspjeh_embed("Statistike Resetirane")
     embed.add_field(name="Igrač", value=member.display_name)
     embed.add_field(name="ACR reset na", value="1000")
+    embed.add_field(name="Rang reset na", value=rang_naziv(1000))
     await ctx.send(embed=embed)
 
 # ═══════════════════════════════════════════════
@@ -915,6 +1061,10 @@ async def adminkomande(ctx):
     embed.add_field(name="⚖️  Disciplina", value=(
         "`!kazna @korisnik <iznos> <razlog>` — Oduzmi ACR kao kaznu\n"
         "`!kazne_povijest [@korisnik]` — Pregled svih kazni"
+    ), inline=False)
+
+    embed.add_field(name="🔧  Sustav", value=(
+        "`!sync_uloge` — Sinkronizira rang uloge za sve igrače"
     ), inline=False)
 
     await ctx.send(embed=embed)
