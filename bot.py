@@ -4,7 +4,7 @@ import os
 import sqlite3
 
 # =========================
-# INTENTS
+# BOT SETUP
 # =========================
 intents = discord.Intents.default()
 intents.message_content = True
@@ -17,7 +17,7 @@ AKTIVNI_MEC = None
 ZADNJI_POBJEDNIK = None
 
 # =========================
-# DB
+# DATABASE
 # =========================
 conn = sqlite3.connect("bot.db")
 c = conn.cursor()
@@ -26,10 +26,10 @@ c.execute("""
 CREATE TABLE IF NOT EXISTS igraci (
     id TEXT PRIMARY KEY,
     acr INTEGER DEFAULT 1000,
-    pobjede INTEGER DEFAULT 0,
-    porazi INTEGER DEFAULT 0,
+    wins INTEGER DEFAULT 0,
+    losses INTEGER DEFAULT 0,
     mvp INTEGER DEFAULT 0,
-    turniri INTEGER DEFAULT 0
+    tournaments INTEGER DEFAULT 0
 )
 """)
 
@@ -45,10 +45,7 @@ conn.commit()
 # =========================
 # HELPERS
 # =========================
-def lista(x):
-    return [i for i in x.split(",") if i]
-
-def igrac(uid):
+def ensure_player(uid):
     c.execute("SELECT * FROM igraci WHERE id=?", (uid,))
     if not c.fetchone():
         c.execute("INSERT INTO igraci VALUES (?,1000,0,0,0,0)", (uid,))
@@ -61,11 +58,7 @@ def get_team(uid):
             return ime.upper()
     return None
 
-def tim_exists(name):
-    c.execute("SELECT * FROM timovi WHERE ime=?", (name.upper(),))
-    return c.fetchone()
-
-def admin(ctx):
+def is_admin(ctx):
     return ctx.author.guild_permissions.administrator
 
 async def announce(ctx, embed):
@@ -87,26 +80,10 @@ async def on_ready():
 # =========================
 @bot.command()
 async def commands(ctx):
-    embed = discord.Embed(title="🎮 PLAYER COMMANDS", color=0x2ecc71)
-
-    embed.add_field(
-        name="Team System",
-        value="!create <name>\n!join <team>\n!leave",
-        inline=False
-    )
-
-    embed.add_field(
-        name="Stats",
-        value="!stats [@user]",
-        inline=False
-    )
-
-    embed.add_field(
-        name="Other",
-        value="!leaderboard",
-        inline=False
-    )
-
+    embed = discord.Embed(title="🎮 Commands", color=0x2ecc71)
+    embed.add_field(name="Team", value="!create !join !leave", inline=False)
+    embed.add_field(name="Stats", value="!stats", inline=False)
+    embed.add_field(name="Leaderboard", value="!leaderboard", inline=False)
     await ctx.send(embed=embed)
 
 @bot.command()
@@ -114,12 +91,12 @@ async def create(ctx, name):
     name = name.upper()
     uid = str(ctx.author.id)
 
-    if tim_exists(name):
+    c.execute("SELECT * FROM timovi WHERE ime=?", (name,))
+    if c.fetchone():
         return await ctx.send("❌ Team exists.")
 
     c.execute("INSERT INTO timovi VALUES (?,?)", (name, uid))
     conn.commit()
-
     await ctx.send(f"🏆 Team {name} created.")
 
 @bot.command()
@@ -129,11 +106,12 @@ async def join(ctx, name):
     if get_team(uid):
         return await ctx.send("❌ Already in team.")
 
-    t = tim_exists(name)
+    c.execute("SELECT clanovi FROM timovi WHERE ime=?", (name.upper(),))
+    t = c.fetchone()
     if not t:
         return await ctx.send("❌ Team not found.")
 
-    clanovi = lista(t[1])
+    clanovi = t[0].split(",") if t[0] else []
 
     if len(clanovi) >= 5:
         return await ctx.send("❌ Team full.")
@@ -152,13 +130,14 @@ async def leave(ctx):
 
     c.execute("SELECT ime, clanovi FROM timovi")
     for ime, clanovi in c.fetchall():
-        l = lista(clanovi)
-        if uid in l:
-            l.remove(uid)
-            c.execute("UPDATE timovi SET clanovi=? WHERE ime=?",
-                      (",".join(l), ime))
-            conn.commit()
-            return await ctx.send("🚪 Left team.")
+        if clanovi:
+            l = clanovi.split(",")
+            if uid in l:
+                l.remove(uid)
+                c.execute("UPDATE timovi SET clanovi=? WHERE ime=?",
+                          (",".join(l), ime))
+                conn.commit()
+                return await ctx.send("🚪 Left team.")
 
     await ctx.send("❌ Not in team.")
 
@@ -170,12 +149,12 @@ async def stats(ctx, member: discord.Member = None):
     member = member or ctx.author
     uid = str(member.id)
 
-    igrac(uid)
+    ensure_player(uid)
 
-    c.execute("SELECT acr,pobjede,porazi,mvp,turniri FROM igraci WHERE id=?", (uid,))
+    c.execute("SELECT acr,wins,losses,mvp,tournaments FROM igraci WHERE id=?", (uid,))
     acr,w,l,m,t = c.fetchone()
 
-    embed = discord.Embed(title=f"📊 Stats - {member.display_name}", color=0x3498db)
+    embed = discord.Embed(title=f"📊 Stats {member.display_name}", color=0x3498db)
     embed.add_field(name="ACR", value=acr)
     embed.add_field(name="Wins", value=w)
     embed.add_field(name="Losses", value=l)
@@ -189,21 +168,19 @@ async def stats(ctx, member: discord.Member = None):
 # =========================
 @bot.command()
 async def leaderboard(ctx):
-    c.execute("SELECT id, acr, turniri FROM igraci ORDER BY acr DESC")
+    c.execute("SELECT id, acr, tournaments FROM igraci ORDER BY acr DESC")
     rows = c.fetchall()
 
     embed = discord.Embed(title="🏆 Leaderboard", color=0xf1c40f)
 
     def rank(acr):
-        if acr < 900: return "🟫 Bronze"
-        if acr < 1100: return "⬜ Silver"
-        if acr < 1300: return "🟨 Gold"
-        if acr < 1500: return "🟦 Platinum"
-        if acr < 1700: return "🟪 Diamond"
-        return "🔥 Elite"
+        if acr < 900: return "Bronze"
+        if acr < 1100: return "Silver"
+        if acr < 1300: return "Gold"
+        if acr < 1500: return "Platinum"
+        return "Elite"
 
-    place = 1
-
+    i = 1
     for uid, acr, t in rows[:10]:
         member = ctx.guild.get_member(int(uid))
         name = member.display_name if member else "Unknown"
@@ -211,142 +188,82 @@ async def leaderboard(ctx):
         team = get_team(uid) or "No team"
 
         embed.add_field(
-            name=f"{place}. {name}",
-            value=f"{rank(acr)}\nACR: {acr}\nTeam: {team}\n🏆 Tournaments: {t}",
+            name=f"{i}. {name}",
+            value=f"{rank(acr)} | ACR {acr}\nTeam: {team}\n🏆 {t}",
             inline=False
         )
-
-        place += 1
+        i += 1
 
     await ctx.send(embed=embed)
 
 # =========================
-# ADMIN COMMANDS MENU
+# ADMIN BASIC
 # =========================
 @bot.command()
 async def admincommands(ctx):
-    if not admin(ctx):
+    if not is_admin(ctx):
         return await ctx.send("❌ Admin only.")
 
-    embed = discord.Embed(title="🛠 ADMIN COMMANDS", color=0xe74c3c)
+    await ctx.send("!start !win !addplayer !removeplayer !tournamentwin")
 
-    embed.add_field(name="Match",
-                    value="!start <A> <B> <map>\n!win <team> <score> <mvp>",
-                    inline=False)
-
-    embed.add_field(name="ACR",
-                    value="!acr @player kills deaths assists adr hs util flash",
-                    inline=False)
-
-    embed.add_field(name="Teams",
-                    value="!addplayer @user <team>\n!removeplayer @user",
-                    inline=False)
-
-    embed.add_field(name="Tournament",
-                    value="!tournamentwin <userID>",
-                    inline=False)
-
-    await ctx.send(embed=embed)
-
-# =========================
-# ADD / REMOVE PLAYER (RESTORED)
-# =========================
 @bot.command()
 async def addplayer(ctx, member: discord.Member, team):
-    if not admin(ctx):
+    if not is_admin(ctx):
         return await ctx.send("❌ Admin only.")
 
     uid = str(member.id)
-    team = team.upper()
 
-    t = tim_exists(team)
+    c.execute("SELECT clanovi FROM timovi WHERE ime=?", (team.upper(),))
+    t = c.fetchone()
     if not t:
         return await ctx.send("❌ Team not found.")
 
-    clanovi = lista(t[1])
+    l = t[0].split(",") if t[0] else []
 
-    if len(clanovi) >= 5:
-        return await ctx.send("❌ Team full.")
+    if uid in l:
+        return await ctx.send("❌ Already in team.")
 
-    clanovi.append(uid)
+    l.append(uid)
 
     c.execute("UPDATE timovi SET clanovi=? WHERE ime=?",
-              (",".join(clanovi), team))
+              (",".join(l), team.upper()))
     conn.commit()
 
-    await ctx.send(f"✅ Added {member.display_name} to {team}")
+    await ctx.send("✅ Added.")
 
 @bot.command()
 async def removeplayer(ctx, member: discord.Member):
-    if not admin(ctx):
+    if not is_admin(ctx):
         return await ctx.send("❌ Admin only.")
 
     uid = str(member.id)
 
     c.execute("SELECT ime, clanovi FROM timovi")
     for ime, clanovi in c.fetchall():
-        l = lista(clanovi)
-        if uid in l:
+        if clanovi and uid in clanovi.split(","):
+            l = clanovi.split(",")
             l.remove(uid)
+
             c.execute("UPDATE timovi SET clanovi=? WHERE ime=?",
                       (",".join(l), ime))
             conn.commit()
-            return await ctx.send(f"🚪 Removed from {ime}")
 
-    await ctx.send("❌ Not found in any team.")
+            return await ctx.send("🚪 Removed.")
 
 # =========================
-# TOURNAMENT WIN
+# TOURNAMENT
 # =========================
 @bot.command()
 async def tournamentwin(ctx, user_id):
-    if not admin(ctx):
+    if not is_admin(ctx):
         return await ctx.send("❌ Admin only.")
 
-    igrac(str(user_id))
-    c.execute("UPDATE igraci SET turniri=turniri+1 WHERE id=?", (str(user_id),))
+    ensure_player(str(user_id))
+
+    c.execute("UPDATE igraci SET tournaments=tournaments+1 WHERE id=?", (str(user_id),))
     conn.commit()
 
-    await ctx.send(f"🏆 Tournament win added to {user_id}")
-
-# =========================
-# MATCH SYSTEM
-# =========================
-@bot.command()
-async def start(ctx, a, b, mapa):
-    global AKTIVNI_MEC
-    if not admin(ctx):
-        return await ctx.send("❌ Admin only.")
-
-    AKTIVNI_MEC = {"a": a.upper(), "b": b.upper(), "mapa": mapa}
-
-    embed = discord.Embed(title="🔥 MATCH STARTED", color=0xe67e22)
-    embed.add_field(name="Teams", value=f"{a} vs {b}")
-    embed.add_field(name="Map", value=mapa)
-
-    await announce(ctx, embed)
-
-@bot.command()
-async def win(ctx, team, score, mvp):
-    global AKTIVNI_MEC, ZADNJI_POBJEDNIK
-
-    if not AKTIVNI_MEC:
-        return await ctx.send("❌ No match.")
-
-    ZADNJI_POBJEDNIK = team.upper()
-
-    igrac(str(mvp))
-    c.execute("UPDATE igraci SET mvp=mvp+1 WHERE id=?", (str(mvp),))
-    conn.commit()
-
-    embed = discord.Embed(title="🏆 MATCH RESULT", color=0x2ecc71)
-    embed.add_field(name="Winner", value=team)
-    embed.add_field(name="Score", value=score)
-    embed.add_field(name="MVP", value=f"<@{mvp}>")
-
-    AKTIVNI_MEC = None
-
-    await announce(ctx, embed)
+    await ctx.send("🏆 Tournament added.")
 
 # =========================
 # RUN
